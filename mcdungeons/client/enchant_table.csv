@@ -1,0 +1,162 @@
+type_id,name,enum_name,category_raw,category_name,rarity
+1,Sharpness,Sharpness,1,Melee,Common
+2,Knockback,Knockback,1,Melee,Common
+3,Looting,Looting,3,Melee|Ranged,Common
+4,Prospector,Prospector,11,Melee|Ranged|Armor,Common
+5,Fire Aspect,FireAspect,3,Melee|Ranged,Common
+6,Rampaging,Rampaging,1,Melee,Common
+7,Exploding,Exploding,3,Melee|Ranged,Powerful
+8,Critical Hit,CriticalHit,3,Melee|Ranged,Powerful
+9,Freezing,Freezing,1,Melee,Common
+10,Poison Cloud,PoisonedMelee,1,Melee,Common
+11,Poison,JunglePoisonMelee,1,Melee,Common
+12,Leeching,Leeching,1,Melee,Common
+13,Aiding,Aiding,1,Melee,Powerful
+14,Gravity,GravityMelee,1,Melee,Powerful
+15,Enigma Resonator,EnigmaResonatorMelee,1,Melee,Common
+16,Anima Conduit,AnimaConduitMelee,1,Melee,Common
+17,Stunning,Stunning,1,Melee,Common
+18,Cave Spider,CaveSpiderPoisonEnchantment,1,Melee,Common
+19,Swirling,Swirling,1,Melee,Powerful
+20,Smiting,Smiting,3,Melee|Ranged,Common
+21,Committed,Committed,3,Melee|Ranged,Common
+22,Soul Siphon,SoulSiphon,3,Melee|Ranged,Common
+23,Radiance,RadianceMelee,1,Melee,Powerful
+24,Chains,Chains,1,Melee,Common
+25,Thundering,Thundering,1,Melee,Common
+26,Echo,Echo,1,Melee,Common
+27,Shockwave,Shockwave,1,Melee,Powerful
+28,Weakening,Weakening,3,Melee|Ranged,Common
+29,Busy Bee,BusyBee,1,Melee,Common
+30,Dynamo,DynamoMelee,1,Melee,Common
+31,Illager's Bane,BaneOfIllagers,1,Melee,Common
+32,Rushdown,Rushdown,1,Melee,Common
+33,Sponge Strike,SpongeStrike,1,Melee,Common
+34,Heavyweight,Heavyweight,1,Melee,Common
+35,Artifact Synergy,DamageSynergy,1,Melee,Common
+36,Pain Cycle,PainCycle,1,Melee,Common
+37,Guarding Strike,GuardingStrike,1,Melee,Common
+38,Refreshment,PotionThirstMelee,1,Melee,Powerful
+39,WitherEnchantmentMelee,WitherEnchantmentMelee,1,Melee,Common
+40,Void Strike,VoidTouchedMelee,1,Melee,Powerful
+41,Shared Pain,SharedPain,1,Melee,Common
+42,Blind,BlindMelee,1,Melee,Common
+43,Ambush,Backstabber,1,Melee,Common
+44,Shadow Blast,ShadowFlash,8,Armor,Common
+45,Damage Counter,DamageCounter,64,Permanent,Common
+46,Shadow Surge,ShadowFeast,8,Armor,Common
+47,Tempo Theft,TempoTheft,2,Ranged,Powerful
+48,Alacrity Adjustment,AlacrityAdjustment,2,Ranged,Common
+49,Bow's Boon,BowsBoon,2,Ranged,Common
+50,Ricochet,Ricochet,2,Ranged,Common
+51,Power,Power,2,Ranged,Common
+52,Punch,Punch,2,Ranged,Common
+53,Infinity,Infinity,2,Ranged,Common
+54,Multishot,MultiShot,2,Ranged,Common
+55,Piercing,Piercing,2,Ranged,Common
+56,Projectile Counter,ProjectileCounter,64,Permanent,Common
+57,Chain Reaction,ChainReaction,2,Ranged,Powerful
+58,Gravity,Gravity,2,Ranged,Powerful
+59,Hunting Bow Enchantment,HuntingBowEnchantment,2,Ranged,Common
+60,Enigma Resonator,EnigmaResonatorRanged,2,Ranged,Common
+61,Anima Conduit,AnimaConduitRanged,2,Ranged,Common
+62,Poison Cloud,PoisonedRanged,2,Ranged,Common
+63,Poison,JunglePoisonRanged,2,Ranged,Common
+64,Freezing Ranged,FreezingRanged,2,Ranged,Common
+65,Rapid Fire,RapidFire,2,Ranged,Common
+66,Supercharge,Supercharge,2,Ranged,Common
+67,Bonus Shot,BonusShot,2,Ranged,Common
+68,Unchanting,Unchanting,3,Melee|Ranged,Common
+69,Fuse Shot,FuseShot,2,Ranged,Common
+70,Radiance Shot,RadianceRanged,2,Ranged,Common
+71,Accelerate,Accelerating,2,Ranged,Common
+72,Growing,Growing,2,Ranged,Common
+73,Wild Rage,WildRage,2,Ranged,Common
+74,Slow Bow Enchantment,SlowBowEnchantment,2,Ranged,Common
+75,Dynamo,DynamoRanged,2,Ranged,Common
+76,Burst Bowstring,BurstBowstring,2,Ranged,Common
+77,ChargingAcceleration,ChargingAcceleration,2,Ranged,Common
+78,CogCrossbowEnchantment,CogCrossbowEnchantment,2,Ranged,Common
+79,Wind Bow Enchantment,WindBowEnchantment,2,Ranged,Common
+80,Reliable Ricochet,ReliableRicochet,2,Ranged,Common
+81,Overcharge,MultiCharge,2,Ranged,Powerful
+82,Refreshment,PotionThirstRanged,2,Ranged,Powerful
+83,Cooldown Shot,CooldownShot,2,Ranged,Common
+84,Artifact Charge,ArtifactCharge,2,Ranged,Common
+85,WitherEnchantmentRanged,WitherEnchantmentRanged,2,Ranged,Common
+86,Shock Web,ShockWeb,2,Ranged,Powerful
+87,Void Strike,VoidTouchedRanged,2,Ranged,Powerful
+88,Shadow Shot,ShadowShot,2,Ranged,Common
+89,Shadow Barb,ShadowBarbRanged,2,Ranged,Common
+90,Levitation Shot,LevitationShot,2,Ranged,Powerful
+91,Dipping Poison,DippingPoison,2,Ranged,Common
+92,Freezing,FreezingAoe,4,Aoe,Common
+93,Protection,Protection,8,Armor,Powerful
+94,Cool Down,Celerity,8,Armor,Common
+95,Final Shout,FinalShout,8,Armor,Powerful
+96,Deflect,Deflecting,8,Armor,Common
+97,Regeneration,Regeneration,8,Armor,Common
+98,Thorns,Thorns,8,Armor,Common
+99,Ancient Guardian Thorns,AncientGuardianThorns,8,Armor,Common
+100,Heals Allies,Altruistic,8,Armor,Powerful
+101,Shielding,Shielding,8,Armor,Common
+102,Barrier,Barrier,8,Armor,Powerful
+103,HuntingBowTaggedEnchantment,HuntingBowTaggedEnchantment,8,Armor,Common
+104,Recycler,Recycler,8,Armor,Common
+105,Chilling,Chilling,8,Armor,Powerful
+106,Cowardice,Cowardice,8,Armor,Common
+107,Electrified,Electrified,8,Armor,Common
+108,Burning,Burning,8,Armor,Common
+109,Snowball,Snowing,8,Armor,Common
+110,Gravity Pulse,GravityPulse,8,Armor,Powerful
+111,Fire Trail,FireTrail,8,Armor,Common
+112,Frenzied,Frenzied,8,Armor,Common
+113,Swiftfooted,Swiftfooted,8,Armor,Common
+114,Soul Speed,SpiritSpeed,8,Armor,Common
+115,Potion Barrier,PotionFortification,8,Armor,Common
+116,Food Reserves,FoodReserves,8,Armor,Common
+117,Surprise Gift,SurpriseGift,8,Armor,Common
+118,Double Damage,DoubleDamage,8,Armor,Common
+119,Fast Attack,FastAttack,8,Armor,Common
+120,Quick,Quick,8,Armor,Common
+121,Health Synergy,HealthSynergy,8,Armor,Common
+122,Speed Synergy,SpeedSynergy,8,Armor,Common
+123,Explorer,Explorer,8,Armor,Common
+124,Vessel Trail,VesselTrail,8,Armor,Common
+125,Slow Resistance,SlowResistance,8,Armor,Common
+126,Slow Immunity,SlowImmunity,8,Armor,Common
+127,Tumble Bee,TumbleBee,8,Armor,Common
+128,Bag Of Souls,BagOfSouls,8,Armor,Common
+129,Acrobat,Acrobat,8,Armor,Common
+130,Push Volume Immunity,PushVolumeImmunity,8,Armor,Common
+131,Wind Resistance,WindResistance,8,Armor,Common
+132,Wind Immunity,WindImmunity,8,Armor,Common
+133,Roll Charge,RollCharge,2,Ranged,Common
+134,Multi-Roll,MultiDodge,8,Armor,Powerful
+135,Lucky Explorer,EmeraldDivination,8,Armor,Common
+136,Death Barter,DeathBarter,8,Armor,Powerful
+137,Life Boost,ResurrectionSurge,8,Armor,Common
+138,Huge,Huge,8,Armor,Common
+139,Mob Resurrection Aura,ResurrectSurroundingMobs,8,Armor,Common
+140,Invisible,Invisible,8,Armor,Powerful
+141,Poison Focus,PoisonFocus,8,Armor,Powerful
+142,Fire Focus,FireFocus,8,Armor,Powerful
+143,Soul Focus,SoulFocus,8,Armor,Powerful
+144,Lightning Focus,LightningFocus,8,Armor,Powerful
+145,Rush,Flee,8,Armor,Common
+146,Beast Surge,BeastSurge,8,Armor,Common
+147,Beast Burst,BeastBurst,8,Armor,Common
+148,Beast Boss,BeastBoss,8,Armor,Common
+149,Reckless,Reckless,8,Armor,Powerful
+150,Current Immunity,CurrentImmunity,8,Armor,Common
+151,Current Resistance,CurrentResistance,8,Armor,Common
+152,Thrive Under Pressure,ThriveUnderPressure,8,Armor,Common
+153,Void Blast,VoidBlast,8,Armor,Common
+154,Shulker Sentry,ShulkerSentry,8,Armor,Common
+155,Luck Of The Sea,LuckOfTheSea,8,Armor,Common
+156,Underwater Immunity,UnderwaterImmunity,8,Armor,Common
+157,PlayerIdle,PlayerIdle,64,Permanent,Common
+158,BardIdle,BardIdle,64,Permanent,Common
+159,BardUnique1Idle,BardUnique1Idle,64,Permanent,Common
+160,PassiveRegen,PassiveRegen,64,Permanent,Common
+161,Void Strike Immunity,VoidStrikeImmunity,8,Armor,Common

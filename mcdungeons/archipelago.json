@@ -1,0 +1,8 @@
+{
+    "game": "Minecraft Dungeons",
+    "world_version": "0.0.1",
+    "minimum_ap_version": "0.6.4",
+    "authors": ["FishTheCook"],
+    "version": 7,
+    "compatible_version": 7
+}

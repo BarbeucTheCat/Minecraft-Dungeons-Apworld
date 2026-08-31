@@ -1,0 +1,29 @@
+# Build artifacts (dungeons_bridge.dll compilation via cl /LD or Visual Studio)
+Debug/
+Release/
+x64/
+x86/
+.vs/
+*.obj
+*.exp
+*.lib
+*.ilk
+*.pdb
+
+# Code signing material - NEVER commit the private key
+*.pfx
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# The .apworld itself is a build output (a zip of mcdungeons/) -
+# publish it via GitHub Releases, not as a tracked file, so the repo
+# doesn't carry two copies of the same source (once as loose files,
+# once zipped inside the .apworld).
+*.apworld
+
+# OS noise
+Thumbs.db
+.DS_Store
