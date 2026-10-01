@@ -28,6 +28,16 @@ antivirus heuristics flag even when nothing malicious is happening.
 your antivirus blocks it, add an exclusion for this folder, or check
 the release notes for a link to submit a false-positive report.
 
+
+## Contributeurs 
+
+Souls gamer (jorisx_x): Steam/Microsoft store 
+Banandrex (banandrex): Steam
+Radmou99 (radmou99): Minecraft launcher/Microsoft store
+Gamet (gamette): Steam
+Abradus (abradus): Steam
+Sarinyan (sarinyan): Steam
+
 ## Development
 
 See [`mcdungeons/client/README.md`](mcdungeons/client/README.md) for
