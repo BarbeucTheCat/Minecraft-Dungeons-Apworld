@@ -29,14 +29,14 @@ your antivirus blocks it, add an exclusion for this folder, or check
 the release notes for a link to submit a false-positive report.
 
 
-## Contributeurs 
+## Contributors
 
-Souls gamer (jorisx_x): Steam/Microsoft store 
-Banandrex (banandrex): Steam
-Radmou99 (radmou99): Minecraft launcher/Microsoft store
-Gamet (gamette): Steam
-Abradus (abradus): Steam
-Sarinyan (sarinyan): Steam
+- Souls gamer (jorisx_x): Steam / Microsoft Store
+- Banandrex (banandrex): Steam
+- Radmou99 (radmou99): Minecraft Launcher / Microsoft Store
+- Gamet (gamette): Steam
+- Abradus (abradus): Steam
+- Sarinyan (sarinyan): Steam
 
 ## Development
 
