@@ -46,5 +46,6 @@ The client adds a few local commands beyond the usual Archipelago client command
 - `/status` - Show current game state (zone, health, attach status).
 - `/unlocked` - List zones unlocked so far this run.
 - `/debug_interacts` - Devtool to get information on what the player interacted with.
+- `/void` - Devtool, DO NOT TOUCH: it changes how the bridge protects the game during level transitions, and changing it can crash the game.
 - `/reset_progress` - Safety feature if a chest is skipped - shouldn't happen normally.
 - `/give_safe` - Only use it if the game clears your inventory - it shouldn't happen, but again, it's for safety.

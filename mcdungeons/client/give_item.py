@@ -444,7 +444,27 @@ LOADING_MAX_WAIT = 120.0
 
 
 def _is_transient_memory_error(e):
-    return isinstance(e, (pymem.exception.MemoryReadError, pymem.exception.WinAPIError))
+    if isinstance(e, (pymem.exception.MemoryReadError, pymem.exception.WinAPIError)):
+        return True
+    # find_function_on_class raises a plain RuntimeError (not a memory-
+    # access exception) when it can't resolve a function within its class-
+    # hierarchy walk in time - this happens for real during a zone
+    # transition, when the class chain being walked is itself mid-
+    # teardown/rebuild (pointers resolve to something, just not a
+    # consistent chain yet), not a genuine "this class never has that
+    # function" case. Without this, that RuntimeError propagated as a
+    # hard failure immediately instead of being retried like every other
+    # zone-transition symptom here - contradicting the "will retry"
+    # message already logged one level up in dungeons_ap_client.py.
+    if isinstance(e, RuntimeError) and "not found within" in str(e) and "levels of the class hierarchy" in str(e):
+        return True
+    # dungeons_bridge.dll (safety build) cancels queued calls instead of running
+    # them against a dead world: while the hook is silent, after a level change,
+    # or when a queued call got too old. calldata()/call() raise a RuntimeError
+    # containing "ERROR:cancelled" - a normal transition symptom, retry it.
+    if isinstance(e, RuntimeError) and "ERROR:cancelled" in str(e):
+        return True
+    return False
 
 
 def _wait_for_zone_transition(func, *args, **kwargs):

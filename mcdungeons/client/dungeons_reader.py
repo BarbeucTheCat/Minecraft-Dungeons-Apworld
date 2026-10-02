@@ -88,6 +88,7 @@ import json
 import os
 import struct
 import sys
+import tempfile
 import time
 
 # See dungeons_ap_client.py's matching comment - needed so the plain
@@ -99,7 +100,9 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from _apworld_data import Locations as _apw_locations, ZoneData as _apw_zonedata
 from item_lookup import ITEM_TABLE
 
-PROCESS_NAME = "Dungeons.exe"  # adjust if needed (or Dungeons-Win64-Shipping.exe)
+# PROCESS_NAME used to be a single flat constant here ("Dungeons.exe").
+# Now defined per-store further below, right after GAME_STORE is resolved
+# from game_store.json - same pattern as STORE_OFFSETS.
 
 
 def load_lookup(filename, defaults=None):
@@ -164,10 +167,6 @@ def interactive_review(unknowns, lookup, lookup_filename, kind_label, candidates
     print("Done - saved entries are permanent, no need to re-identify.\n")
 
 OFFSETS = {
-    "gworld": 0x47540B0,
-    "gobjects": 0x46556C8,  # FUObjectArray struct itself (from Dumper-7's OffsetsInfo.json
-                             # OFFSET_GOBJECTS=73750216) - confirmed same build/base scheme
-                             # as gworld above (Dumper-7's OFFSET_GWORLD matched exactly).
     "persistent_level": 0x30,
     "game_instance": 0x160,
     "local_players": 0x38,
@@ -192,6 +191,110 @@ OFFSETS = {
     # reads serialized_id.
     "display_id": 0x0,
 }
+
+# ------------------------------------------------------------
+# Per-distribution-channel offsets - GObjects/GWorld are the two we've
+# directly confirmed can drift (they did, silently, on a routine Steam
+# content update). Everything else in the OFFSETS dict above is a
+# game-logic field (Blueprint/native class layout), NOT an engine global -
+# treated as shared across channels/versions until a specific one is
+# actually caught drifting (at which point it moves down here next to
+# gworld/gobjects, the same way those two originally became separate
+# from the rest).
+#
+# "steam", "microsoft_store", and "minecraft_launcher" are all confirmed
+# via real Dumper-7 dumps (steam: hash UE4CC-Windows-48B0567B4722BB43C30D8
+# BA0C8D0194E, 2026-09-02; microsoft_store and minecraft_launcher both
+# turned out to match steam's values from BEFORE that channel's game
+# update, since neither of those two channels had received that update
+# yet at dump time - they're not actually placeholders/copies, they're
+# independently confirmed to genuinely be on the same older build as
+# each other, coincidentally).
+STORE_OFFSETS = {
+    "steam": {
+        "gworld": 0x4795230,
+        "gobjects": 0x4696848,  # FUObjectArray struct itself (from Dumper-7's
+                                 # OffsetsInfo.json OFFSET_GOBJECTS)
+    },
+    "minecraft_launcher": {
+        # Confirmed via a real Dumper-7 dump of this build's Basic.hpp.
+        # Matches the same pre-update values as microsoft_store below -
+        # this channel also hasn't received the update steam's channel got.
+        "gworld": 0x47540B0,
+        "gobjects": 0x46556C8,
+    },
+    "microsoft_store": {
+        # Confirmed 2026-09-05 via a real Dumper-7 dump of the MS Store
+        # build's Basic.hpp. These match the ORIGINAL Steam values from
+        # before that channel's game update (0x47540B0/0x46556C8) -
+        # Microsoft Store is simply still on that older build, not yet
+        # patched to whatever Steam's channel already received.
+        "gworld": 0x47540B0,
+        "gobjects": 0x46556C8,
+    },
+}
+
+# Per-store process executable name - see PROCESS_NAME's own comment
+# further above for why this can't be one flat constant. "steam" confirmed
+# directly as "Dungeons-Win64-Shipping.exe" (the actual UE4 shipping
+# binary); "microsoft_store" and "minecraft_launcher" both confirmed
+# directly as "Dungeons.exe" instead - genuinely different from Steam on
+# both of those storefronts, not a wrapper/launcher artifact to work
+# around.
+STORE_PROCESS_NAMES = {
+    "steam": "Dungeons-Win64-Shipping.exe",
+    "minecraft_launcher": "Dungeons.exe",
+    "microsoft_store": "Dungeons.exe",
+}
+
+GAME_STORE_FILE = os.path.join(
+    os.environ.get("LOCALAPPDATA") or tempfile.gettempdir(),
+    "MCDungeonsAP", "game_store.json")
+
+
+def load_game_store():
+    """Which distribution channel the attached game process is - selects
+    which STORE_OFFSETS entry gets merged into OFFSETS below. Persisted
+    as an absolute path under DATA_DIR (independent of cwd) so it only
+    needs setting once per machine via /set_store or `python
+    dungeons_reader.py set_store <channel>`, not every launch. Defaults
+    to "steam" - the only channel actually confirmed so far - if never
+    set."""
+    if os.path.exists(GAME_STORE_FILE):
+        try:
+            with open(GAME_STORE_FILE) as f:
+                store = json.load(f).get("store")
+                if store in STORE_OFFSETS:
+                    return store
+        except Exception:
+            pass
+    return "steam"
+
+
+def save_game_store(store):
+    if store not in STORE_OFFSETS:
+        raise ValueError(f"Unknown store {store!r} - must be one of {list(STORE_OFFSETS)}")
+    os.makedirs(os.path.dirname(GAME_STORE_FILE), exist_ok=True)
+    with open(GAME_STORE_FILE, "w") as f:
+        json.dump({"store": store}, f)
+
+    # Also apply immediately to the CURRENT session, not just future
+    # launches. GAME_STORE/OFFSETS/PROCESS_NAME below are plain module-
+    # level globals, and every place that actually uses them (the attach
+    # loop, pick_target_pid, module_from_name, ...) lives in THIS file and
+    # references them as bare names - Python resolves those against the
+    # module's current globals at CALL time, not at function-definition
+    # time, so reassigning them here takes effect on the very next call,
+    # no restart needed.
+    global GAME_STORE, PROCESS_NAME
+    GAME_STORE = store
+    OFFSETS.update(STORE_OFFSETS[store])
+    PROCESS_NAME = STORE_PROCESS_NAMES[store]
+
+
+GAME_STORE = load_game_store()
+OFFSETS.update(STORE_OFFSETS[GAME_STORE])
+PROCESS_NAME = STORE_PROCESS_NAMES[GAME_STORE]
 
 # ------------------------------------------------------------
 # FNamePool - external, read-only resolution of real name STRINGS
@@ -221,13 +324,76 @@ FNAME_MAX_BLOCKS = 8192        # capacity of FNamePool::Blocks[]
 _gnames_cfg = load_lookup("gnames_address.json", {})
 OFFSETS["gnames"] = _gnames_cfg.get(0)  # stored as {"0": <address>} - single value, reusing load_lookup's {int: X} shape
 
+_resolve_fname_pipe_cache = {}  # {comparison_index: name} - session-lifetime,
+# successes only (see resolve_fname_via_pipe). Shared by every caller
+# (chest classification, gamebp/mission-end-widget verification, etc.) so
+# the same index is never resolved over the pipe twice in one session.
+
+
+def resolve_fname_via_pipe(pm, comparison_index):
+    """Ask the already-injected dungeons_bridge.dll to resolve the name
+    itself, via the game's own FName::AppendString - exactly what
+    Dumper-7 does internally, and more reliable than parsing FNamePool
+    externally (OffsetsInfo.json's OFFSET_GNAMES being 0/null for this
+    build isn't a gap, it's this engine's normal behavior - AppendString
+    is the actually-supported path). The DLL already exposes this over
+    the pipe (HandleResolveName in dungeons_bridge.cpp,
+    "resolve_name:<hex>"). Returns None on any failure (DLL not injected
+    yet, pipe busy, invalid index, etc.) so callers can fall back to the
+    raw gnames-parse path below, or just treat it like any other
+    not-yet-available read.
+
+    Cached (successes only) in _resolve_fname_pipe_cache - a name for a
+    given comparison_index never changes within a session, and the pipe
+    round-trip is a real blocking connect+write+read+close against the
+    DLL's single-instance pipe, not free."""
+    if comparison_index in _resolve_fname_pipe_cache:
+        return _resolve_fname_pipe_cache[comparison_index]
+    try:
+        import win32file
+    except ImportError:
+        return None
+    try:
+        pipe = _connect_bridge_pipe(pm)
+    except Exception:
+        return None
+    try:
+        win32file.WriteFile(pipe, f"resolve_name:{comparison_index:X}".encode())
+        _, data = win32file.ReadFile(pipe, 65536)
+    except Exception:
+        return None
+    finally:
+        win32file.CloseHandle(pipe)
+
+    response = data.decode("utf-8", errors="replace")
+    if response.startswith("ERROR:"):
+        return None  # not cached - transient (e.g. index not valid yet), retry later
+    name = response.rstrip("\x00")
+    # The DLL prefixes successful resolutions with "NAME:" - strip it
+    # here so every caller gets the plain name transparently. Exact-
+    # equality checks (resolve_gamebp_class_index's "GameBP"/"GameBP_C"
+    # match) need this stripped, unlike substring checks elsewhere which
+    # happened to keep working either way.
+    if name.startswith("NAME:"):
+        name = name[len("NAME:"):]
+    _resolve_fname_pipe_cache[comparison_index] = name
+    return name
+
 
 def resolve_fname(pm, comparison_index, pool_base=None, max_len=1024):
-    """Reads a real name string (e.g. "ChestActor") straight out of the
-    engine's own FNamePool for a given comparison_index (the same value
-    used everywhere else in this script as class_name_index). Returns
-    None on any failure - most commonly because pool_base is wrong, or
-    hasn't been found/verified yet (see verify_gnames)."""
+    """Reads a real name string (e.g. "ChestActor") for a given
+    comparison_index (the same value used everywhere else in this script
+    as class_name_index). Tries the injected DLL first (see
+    resolve_fname_via_pipe's comment - this is the actually-supported
+    path for this engine build), then falls back to the raw external
+    FNamePool memory-parse below only if the pipe isn't available (DLL
+    not injected yet) and an explicit pool_base was found some other way
+    (see verify_gnames)."""
+    if pool_base is None:
+        via_pipe = resolve_fname_via_pipe(pm, comparison_index)
+        if via_pipe is not None:
+            return via_pipe
+
     pool_base = pool_base if pool_base is not None else OFFSETS.get("gnames")
     if not pool_base:
         return None
@@ -259,22 +425,147 @@ def resolve_fname(pm, comparison_index, pool_base=None, max_len=1024):
     except Exception:
         return None
 
-# Confirmed via the find_gamebp diagnostic: class_name_index 182042 is a
-# per-level singleton actor (exactly 1 instance per zone, like AGameBP)
-# whose byte at +0x6B8 gave 1/Squid Coast, 2/Creeper Woods, 4/Soggy Swamp
-# across three different missions in the same session - small, distinct,
-# never-repeating values, matching an ELevelNames enum ordinal. This
-# replaces the earlier (wrong) attempt to read the mission field off
-# GameState - that field actually lives on this separate per-level actor,
-# not GameState itself.
+# Confirmed via the find_gamebp diagnostic AND, since then, via the actual
+# Dumper-7 SDK dump: this per-level singleton is AGameBP, a real native
+# class ("class Dungeons.GameBP", STATIC_NAME_IMPL(L"GameBP")). Its +0x6B8
+# field isn't an empirical guess either - it's the confirmed structural
+# path AGameBP.mReplicatedLevelSettings_ONLY_FOR_INITIAL_REPLICATION
+# (FLevelSettings, +0x6B8) -> .MissionState (FMissionState, +0x0) ->
+# .MissionDifficulty (FMissionDifficulty, +0x0) -> .mission (ELevelNames,
+# +0x0) = AGameBP+0x6B8 exactly.
 #
-# CAVEAT: class_name_index values come from this game build/session's
-# FName table ordering. If a game update or a future session ever shows
-# this index resolving to something that doesn't look like a real mission
-# (e.g. every zone reports the same value again, or wildly large numbers),
-# re-run find_gamebp in 2-3 fresh missions and update this constant.
-OFFSETS["gamebp_class_index"] = 182042
-OFFSETS["mission_field"] = 0x6B8   # byte offset on that actor
+# gamebp_class_index is NOT hardcoded anymore - it was (182042, a
+# class_name_index literal), and that's exactly what broke for some
+# testers: class_name_index is an FName-pool POSITION, which is
+# re-assigned fresh each session based on load order (different DLC
+# state, different store/build, even just a different session of the
+# same build) - NOT a stable identifier, unlike the class's actual NAME
+# ("GameBP"), which never changes. resolve_gamebp_class_index (below)
+# finds it dynamically by name each session - same self-healing pattern
+# as MISSION_END_WIDGET_CLASS - and caches the result in
+# GAMEBP_CLASS_LOOKUP_FILE for reuse, always re-verified by name rather
+# than trusted blindly.
+GAMEBP_CLASS_LOOKUP_FILE = "gamebp_class_index.json"
+
+
+def _load_gamebp_class_index():
+    if os.path.exists(GAMEBP_CLASS_LOOKUP_FILE):
+        with open(GAMEBP_CLASS_LOOKUP_FILE) as f:
+            content = f.read().strip()
+        if content:
+            try:
+                return json.loads(content).get("class_name_index")
+            except json.JSONDecodeError:
+                print(f"Warning: {GAMEBP_CLASS_LOOKUP_FILE} isn't valid JSON - starting fresh.")
+    return None
+
+
+def _save_gamebp_class_index(class_name_index):
+    with open(GAMEBP_CLASS_LOOKUP_FILE, "w") as f:
+        json.dump({"class_name_index": class_name_index}, f, indent=2)
+
+
+OFFSETS["gamebp_class_index"] = _load_gamebp_class_index()  # None until resolved - see resolve_gamebp_class_index
+OFFSETS["mission_field"] = 0x6B8   # AGameBP.mReplicatedLevelSettings...MissionState.MissionDifficulty.mission (ELevelNames)
+
+
+def invalidate_gamebp_class_index():
+    """Clears the (confirmed-stale) cached gamebp_class_index, both in
+    memory and on disk, so get_zone_name_index's `if OFFSETS[
+    "gamebp_class_index"] is None:` guard actually re-triggers
+    resolve_gamebp_class_index on the next call inside a real mission.
+    class_name_index is reassigned fresh every session (see the comment
+    above), so this isn't a rare edge case - it's the normal case
+    whenever GAMEBP_CLASS_LOOKUP_FILE survives from a previous session."""
+    OFFSETS["gamebp_class_index"] = None
+    try:
+        if os.path.exists(GAMEBP_CLASS_LOOKUP_FILE):
+            os.remove(GAMEBP_CLASS_LOOKUP_FILE)
+    except Exception:
+        pass
+
+
+def verify_gamebp_class_index_name(pm):
+    """Cheap, always-available sanity check for the CACHED gamebp_class_
+    index - resolves its name and checks it's still "GameBP" (native-
+    style alias used in this project's own comments) or "GameBP_C" (the
+    real compiled name if it's actually a Blueprint asset named "GameBP"
+    - standard UE4 <Name>_C convention, same as every other BP_..._C
+    class seen in this game). Returns True/False, or None if nothing's
+    cached yet or the name can't be resolved right now (inconclusive,
+    not confirmed-bad)."""
+    idx = OFFSETS.get("gamebp_class_index")
+    if idx is None:
+        return None
+    name = resolve_fname(pm, idx)
+    if not name:
+        return None
+    return name in ("GameBP", "GameBP_C", "BP_GameBP_C")
+
+
+_gamebp_ruled_out = set()  # class_name_index values already confirmed
+# NOT "GameBP" this session - without this, the per-call throttle kept
+# re-testing the same handful of classes forever, never making progress
+# into the rest of a 200+-class zone snapshot to find the one that's
+# actually GameBP.
+
+
+def resolve_gamebp_class_index(pm, snapshot, debug_log=None):
+    """Resolves (and persists) gamebp_class_index by NAME, using an
+    already-available scan_full_zone()-style {actor_addr: class_name_
+    index} snapshot rather than a separate GObjects walk - callers
+    (get_zone_name_index) already have one from the current zone scan.
+    Only succeeds while an AGameBP instance actually exists in the
+    current zone (i.e. inside a real mission, not the hub/menu - same
+    practical constraint the manual /find_gamebp tool always had). Once
+    resolved, the result is cached and reused for the rest of this
+    session AND future sessions (verify_gamebp_class_index_name re-checks
+    it by name each session rather than trusting the cache blindly
+    forever). Returns the resolved class_name_index, or None if no
+    AGameBP instance is present in this snapshot to resolve from.
+
+    Throttled to GAMEBP_RESOLVE_TRIES_PER_CALL new (uncached)
+    resolve_fname calls per invocation - a zone can easily have 100+
+    distinct classes, and resolving them all via the DLL pipe in one shot
+    is exactly the kind of per-tick stall the chest-classification
+    throttle was added for. Spreads the cost over multiple calls (ticks)
+    instead. Classes already ruled out (_gamebp_ruled_out) are skipped so
+    each call's throttle budget goes toward NEW candidates instead of
+    re-testing the same ones every time."""
+    if not snapshot:
+        return None
+    GAMEBP_RESOLVE_TRIES_PER_CALL = 15
+    tries = 0
+    failures = 0
+    non_matches = 0
+    sample_names = []
+    candidates = set(snapshot.values()) - _gamebp_ruled_out
+    for cls in candidates:
+        if tries >= GAMEBP_RESOLVE_TRIES_PER_CALL:
+            break
+        tries += 1
+        name = resolve_fname(pm, cls)
+        if name is None:
+            failures += 1
+            continue
+        if name in ("GameBP", "GameBP_C", "BP_GameBP_C"):
+            if debug_log and cls != OFFSETS.get("gamebp_class_index"):
+                debug_log(f"resolve_gamebp_class_index: confirmed class_name_index={cls} name={name!r} "
+                          f"(previously cached: {OFFSETS.get('gamebp_class_index')}) - updating and persisting.")
+            OFFSETS["gamebp_class_index"] = cls
+            _save_gamebp_class_index(cls)
+            return cls
+        non_matches += 1
+        if len(sample_names) < 5:
+            sample_names.append(name)
+        _gamebp_ruled_out.add(cls)
+    if debug_log and tries:
+        debug_log(f"resolve_gamebp_class_index: tried {tries}/{len(candidates)} untested distinct "
+                   f"class(es) this call ({len(_gamebp_ruled_out)} ruled out so far across all calls), "
+                   f"no 'GameBP'/'GameBP_C' match ({failures} resolve_fname failure(s) - pipe/DLL issue "
+                   f"if this is most of them, {non_matches} resolved to a different name, e.g. "
+                   f"{sample_names}). Will keep trying on later calls if untested classes remain.")
+    return None
 
 # Confirmed directly from Dungeons_classes.hpp (Dumper-7 SDK dump) - real
 # offsets, not guessed/scanned. APlayerCharacter::WalletComponent, then
@@ -1311,10 +1602,10 @@ except FileNotFoundError:
     MOB_ID_ORDER = []
 
 
-_zone_index_cache = {"value": None, "checked_at": 0.0}
+_zone_index_cache = {"world": None, "value": None, "checked_at": 0.0}
 
 
-def get_zone_name_index(pm, world, min_interval=2.0):
+def get_zone_name_index(pm, world, min_interval=2.0, debug_log=None):
     """Reads the real per-mission ELevelNames byte off the per-level
     singleton actor identified via the find_gamebp diagnostic (see the
     OFFSETS["gamebp_class_index"] comment) - NOT off GameState (that
@@ -1326,11 +1617,30 @@ def get_zone_name_index(pm, world, min_interval=2.0):
     full actor scan every tick would be wasteful. Pass min_interval=0 to
     force a fresh read (e.g. right after detecting a zone change)."""
     now = time.time()
-    if min_interval > 0 and (now - _zone_index_cache["checked_at"]) < min_interval:
+    if (min_interval > 0 and _zone_index_cache["world"] == world and
+            (now - _zone_index_cache["checked_at"]) < min_interval):
+        # world must match, not just "recent enough" - keyed by time
+        # alone, a call for a DIFFERENT world could silently return a
+        # stale answer computed for whatever OTHER world the main tick
+        # loop's own poll happened to cache within the last min_interval
+        # seconds (e.g. chest-interact resolution using a captured
+        # world_ptr right after rejoining a level, while the new zone's
+        # singleton actor hadn't spawned yet at the time of some other
+        # call a moment earlier).
         return _zone_index_cache["value"]
     from collections import Counter
     try:
         snapshot = scan_full_zone(pm, world)
+        if OFFSETS["gamebp_class_index"] is None:
+            # Not resolved yet this session (fresh cache, or the cache
+            # file didn't exist) - try to resolve it by name from THIS
+            # snapshot. Only succeeds if an AGameBP instance actually
+            # exists in the current zone (i.e. inside a real mission) -
+            # see resolve_gamebp_class_index's docstring. A no-op, cheap
+            # check while in the hub/menu (returns None, tried again next
+            # call) until the player is actually in a mission at least
+            # once this session.
+            resolve_gamebp_class_index(pm, snapshot, debug_log=debug_log)
         addrs = [a for a, cls in snapshot.items() if cls == OFFSETS["gamebp_class_index"]]
         if not addrs:
             value = None
@@ -1354,6 +1664,7 @@ def get_zone_name_index(pm, world, min_interval=2.0):
             value = Counter(bytes_read).most_common(1)[0][0] if bytes_read else None
     except Exception:
         value = None
+    _zone_index_cache["world"] = world
     _zone_index_cache["value"] = value
     _zone_index_cache["checked_at"] = now
     return value
@@ -2246,7 +2557,7 @@ PICKUP_TIER_NAMES = {0: "nothing gated pickable yet", 1: "Health items", 2: "Hea
                       3: "Health items + Potions + TNT"}
 
 
-def _connect_bridge_pipe(pm, retries=10, delay=0.05):
+def _connect_bridge_pipe(pm, retries=10, delay=0.05, busy_budget=5.0):
     """Opens a connection to dungeons_bridge.dll's named pipe, retrying
     briefly on failure. PipeServerThread (dungeons_bridge.cpp) recreates
     its named pipe instance fresh after every single client disconnects
@@ -2258,17 +2569,52 @@ def _connect_bridge_pipe(pm, retries=10, delay=0.05):
     back-to-back (set, then get to verify) - a single connection per
     script run was less likely to ever hit this race. Requires pm now
     (not just retries/delay) since the pipe name is per-process - see
-    _pipe_name_for."""
+    _pipe_name_for.
+
+    ERROR_PIPE_BUSY (231) is a DIFFERENT situation and is handled
+    separately: the pipe is created with nMaxInstances=1, so while ANY
+    other client (the client's own per-tick polling, an in-flight item
+    grant, /give_safe holding one connection open across many round
+    trips) has it connected, every other connection attempt gets 231.
+    The old flat 10 x 0.05s retry (0.5s total) gave up far too early -
+    confirmed as the cause of /give_safe failing with "All pipe instances
+    are busy". The right primitive for that is WaitNamedPipe, which
+    blocks until an instance is actually available (or a timeout), so
+    a busy pipe is now waited on for up to busy_budget seconds in total
+    instead of failing after half a second. Other errors keep the old
+    short retry."""
     import win32file
+    try:
+        import win32pipe
+    except Exception:
+        win32pipe = None
     last_error = None
-    for _ in range(retries):
+    name = _pipe_name_for(pm)
+    busy_deadline = time.time() + busy_budget
+    other_attempts = 0
+    while True:
         try:
             return win32file.CreateFile(
-                _pipe_name_for(pm), win32file.GENERIC_READ | win32file.GENERIC_WRITE,
+                name, win32file.GENERIC_READ | win32file.GENERIC_WRITE,
                 0, None, win32file.OPEN_EXISTING, 0, None
             )
         except Exception as e:
             last_error = e
+            remaining = busy_deadline - time.time()
+            if getattr(e, "winerror", None) == 231 and remaining > 0:
+                # ERROR_PIPE_BUSY - wait for the instance to free up
+                # instead of burning the retry budget on it.
+                if win32pipe is not None:
+                    try:
+                        win32pipe.WaitNamedPipe(name, int(max(50, min(1000, remaining * 1000))))
+                    except Exception:
+                        time.sleep(delay)
+                else:
+                    time.sleep(0.1)
+                continue
+            other_attempts += 1
+            if other_attempts >= retries:
+                break
             time.sleep(delay)
     raise last_error
 
@@ -2908,6 +3254,105 @@ _PROCESS_EVENT_SHELLCODE = bytes([
 ])
 
 
+# Safety gate for every remote-thread ProcessEvent call (call_process_event /
+# call_ufunction_no_params bypass the DLL's pipe, hence bypass its silence
+# window). While dungeons_bridge.dll reports its hook as "silent" (startup or
+# a level transition / loading screen) these calls are refused with a normal
+# (False, error) result - every caller already treats that as "retry later".
+# Unknown state (DLL unreachable, older DLL without hook_state) never blocks,
+# so behaviour without the gate is unchanged.
+HOOK_SILENCE_GATE = True
+
+
+def bridge_hook_state(pm):
+    """Returns "active", "silent", or None when the state can't be determined
+    (pywin32 missing, DLL not injected/reachable, DLL without hook_state)."""
+    try:
+        import win32file
+    except ImportError:
+        return None
+    try:
+        pipe = _connect_bridge_pipe(pm)
+    except Exception:
+        return None
+    try:
+        win32file.WriteFile(pipe, b"hook_state")
+        _, data = win32file.ReadFile(pipe, 4096)
+    except Exception:
+        return None
+    finally:
+        try:
+            win32file.CloseHandle(pipe)
+        except Exception:
+            pass
+    response = data.decode("utf-8", errors="replace")
+    if response.startswith("HOOK:silent"):
+        return "silent"
+    if response.startswith("HOOK:active"):
+        return "active"
+    return None
+
+
+_HOOK_SILENT_ERROR = "hook silent (game loading/transition) - retry shortly"
+
+
+def bridge_void_mode(pm, new_mode=None):
+    """Reads (new_mode=None) or sets ("soft"/"hard") how the DLL empties itself
+    during level transitions. soft = hook stays patched in but does nothing;
+    hard = ProcessEvent is physically unpatched for the whole silent window.
+    Returns (ok, response_text)."""
+    try:
+        import win32file
+    except ImportError:
+        return False, "pywin32 missing"
+    try:
+        pipe = _connect_bridge_pipe(pm)
+    except Exception as e:
+        return False, f"DLL pipe not reachable: {e}"
+    try:
+        request = b"get_void_mode" if new_mode is None else f"set_void_mode {new_mode}".encode()
+        win32file.WriteFile(pipe, request)
+        _, data = win32file.ReadFile(pipe, 4096)
+    except Exception as e:
+        return False, f"pipe error: {e}"
+    finally:
+        try:
+            win32file.CloseHandle(pipe)
+        except Exception:
+            pass
+    response = data.decode("utf-8", errors="replace")
+    return (not response.startswith("ERROR")), response
+
+
+def bridge_hook_silence(pm, ms):
+    """Forces the DLL's ProcessEvent hook silent for `ms` milliseconds (the DLL
+    caps this at 30 s). While silent the hook does nothing but forward to the
+    original function (soft void) or is physically unpatched (hard void, see
+    bridge_void_mode). Used at the end of a mission so the level teardown runs
+    with as little of our code in the process as possible. Returns
+    (ok, response_text)."""
+    try:
+        import win32file
+    except ImportError:
+        return False, "pywin32 missing"
+    try:
+        pipe = _connect_bridge_pipe(pm)
+    except Exception as e:
+        return False, f"DLL pipe not reachable: {e}"
+    try:
+        win32file.WriteFile(pipe, f"hook_silence {int(ms)}".encode())
+        _, data = win32file.ReadFile(pipe, 4096)
+    except Exception as e:
+        return False, f"pipe error: {e}"
+    finally:
+        try:
+            win32file.CloseHandle(pipe)
+        except Exception:
+            pass
+    response = data.decode("utf-8", errors="replace")
+    return (not response.startswith("ERROR")), response
+
+
 def call_ufunction_no_params(pm, object_addr, function_addr):
     """Calls a zero-parameter UFunction via ProcessEvent, replicating
     EXACTLY the idiom Dumper-7's own generated wrappers use for native
@@ -2915,6 +3360,10 @@ def call_ufunction_no_params(pm, object_addr, function_addr):
     temporarily OR in FUNC_NATIVE on the function's own FunctionFlags,
     call ProcessEvent(function, nullptr), then restore the original flags.
     Returns (success, error_message)."""
+    # Checked BEFORE touching the UFunction's flags: no engine write at all
+    # while the bridge hook is silent.
+    if HOOK_SILENCE_GATE and bridge_hook_state(pm) == "silent":
+        return False, _HOOK_SILENT_ERROR
     try:
         original_flags = pm.read_uint(function_addr + OFFSETS["ufunction_flags"])
     except Exception as e:
@@ -2961,6 +3410,8 @@ def call_process_event(pm, object_addr, function_addr, params_bytes, force_nativ
     default) for plain Native functions that already carry FUNC_NATIVE
     permanently, like IsMissionCompleted.
     Returns (success, error_message, params_bytes_after)."""
+    if HOOK_SILENCE_GATE and bridge_hook_state(pm) == "silent":
+        return False, _HOOK_SILENT_ERROR, None
     original_flags = None
     try:
         vtable = pm.read_longlong(object_addr)
@@ -4883,6 +5334,22 @@ if __name__ == "__main__":
             print("No UWorld - are you in a level?")
         else:
             watch_for_drops(pm, world)
+    elif len(sys.argv) > 1 and sys.argv[1] == "set_store":
+        # python dungeons_reader.py set_store <steam|minecraft_launcher|microsoft_store>
+        # One-time setting, persisted in DATA_DIR - selects which
+        # STORE_OFFSETS entry (gworld/gobjects) is merged into OFFSETS on
+        # every future run, since these two are the only offsets known to
+        # differ by distribution channel so far. See STORE_OFFSETS' own
+        # comment for calibration status per channel.
+        if len(sys.argv) < 3 or sys.argv[2] not in STORE_OFFSETS:
+            print(f"Usage: python dungeons_reader.py set_store <{'|'.join(STORE_OFFSETS)}>")
+            print(f"Currently set to: {GAME_STORE}")
+        else:
+            save_game_store(sys.argv[2])
+            print(f"Store set to '{sys.argv[2]}'. Restart for it to take effect.")
+            if sys.argv[2] != "steam":
+                print("NOTE: this channel's offsets are still UNCONFIRMED placeholders "
+                      "copied from steam - see STORE_OFFSETS' comment in this file.")
     elif len(sys.argv) > 1 and sys.argv[1] == "survey":
         # python dungeons_reader.py survey
         # Dedicated chest/enemy survey across every zone you visit - uses

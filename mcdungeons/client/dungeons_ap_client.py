@@ -166,6 +166,9 @@ from Utils import async_start
 from dungeons_reader import (
     attach,
     OFFSETS,
+    STORE_OFFSETS,
+    GAME_STORE,
+    save_game_store,
     get_zone_name_index,
     ZONE_NAME_LOOKUP,
     ZONE_ID_ORDER,
@@ -178,6 +181,7 @@ from dungeons_reader import (
     get_spawned_attributes,
     HEALTH_ATTRIBUTE_SET_CLASS,
     kill_local_player,
+    bridge_void_mode,
     call_is_mission_completed,
     IS_MISSION_COMPLETED_INDEX,
     IS_MISSION_COMPLETED_INDEX_FILE,
@@ -287,6 +291,39 @@ ENDGAME_CLICKY_ZONES = {"obsidianpinnacle"}
 # without it, which looked like three unrelated bugs (no chest checks,
 # no boss checks, emeralds stuck at 0) but was really one missing step.
 # Folded in here so the client does it itself.
+# Returned (instead of a Win32 error) when the target PID is no longer a running
+# Dungeons.exe - see _game_process_present.
+GAME_GONE_MESSAGE = ("The game process is no longer running (it closed or crashed) - start the game "
+                     "again; the client attaches and injects the DLL by itself.")
+
+
+def _game_process_name():
+    """The executable name of the CURRENT store's game process. It differs per
+    store - Steam is "Dungeons-Win64-Shipping.exe", Microsoft Store and the
+    Minecraft Launcher are "Dungeons.exe" (dungeons_reader.STORE_PROCESS_NAMES) -
+    and /set_store can change it during a session, so it is read at call time
+    from dungeons_reader, never hardcoded here or taken from auto_inject's
+    own PROCESS_NAME (a fixed "Dungeons.exe" used only by its standalone CLI)."""
+    import dungeons_reader
+    return dungeons_reader.PROCESS_NAME
+
+
+def _game_process_present(pid):
+    """True only if `pid` is still a live game process (whatever the store's
+    executable is called - see _game_process_name). Guards two ways the
+    client can end up holding a stale PID: the game crashed/closed while the
+    client stayed up (the tick loop only notices on its next liveness check),
+    or Windows reused that PID for an unrelated process. Injecting into either
+    fails with "Access denied during VirtualAllocEx (Win32 error 5)", whose
+    generic advice (run as admin, antivirus...) is misleading in that case."""
+    import auto_inject
+    try:
+        return (auto_inject.is_process_alive(pid)
+                and pid in auto_inject.find_all_process_ids(_game_process_name()))
+    except Exception:
+        return True   # can't tell - don't hide a real injection attempt
+
+
 def _ensure_bridge_dll_injected(pid):
     """Extracts dungeons_bridge.dll to DATA_DIR (it's bundled inside the
     .apworld's client/ folder, which - same issue as _apworld_data.py's
@@ -320,6 +357,9 @@ def _ensure_bridge_dll_injected(pid):
     if auto_inject.is_dll_loaded(pid, auto_inject.DLL_NAME):
         return None
 
+    if not _game_process_present(pid):
+        return GAME_GONE_MESSAGE
+
     src_path = str(Path(__file__).resolve().parent / auto_inject.DLL_NAME)
     dll_bytes = __loader__.get_data(src_path)
     dest_path.write_bytes(dll_bytes)
@@ -328,12 +368,42 @@ def _ensure_bridge_dll_injected(pid):
         auto_inject.inject_dll(pid, str(dest_path))
         return None
     except Exception as e:
+        # The game may have died between the check above and the attempt (a
+        # crash leaves the process half-alive for a moment - VirtualAllocEx
+        # then reports "access denied"). Say what actually happened.
+        if not _game_process_present(pid):
+            return GAME_GONE_MESSAGE
         return str(e)
 
 
 GAME_POLL_INTERVAL = 0.2       # seconds - matches the old client's tick rate
+PAWN_ANNOUNCE_DEBOUNCE = 2      # consecutive identical get_pawn readings needed before the
+                               # client announces a change in character presence (filters out
+                               # a single transient bad read so the log doesn't flicker)
 EMERALD_POLL_INTERVAL = 2.0    # currency reads are cheap but no need every tick
 ATTACH_RETRY_INTERVAL = 3.0    # how often to retry finding Dungeons.exe if not attached yet
+PROCESS_STARTUP_GRACE_PERIOD = 0.0   # (was 12.0 - REMOVED, see call site)  # seconds to wait after first finding a NEW Dungeons.exe
+                                     # process before injecting - see the call site's own
+                                     # comment for why ("client before game" crash history).
+                                     # Raised from 5.0 -> 12.0 after a real crash report
+                                     # (client already running/connected before the game was
+                                     # launched) STILL crashed within ~7-8s of injection with
+                                     # the 5.0 value.
+                                     #
+                                     # UPDATE: the actual fix for that crash history turned out
+                                     # to be PAWN_STABILITY_* below, not this constant - a
+                                     # confirmed-more-stable earlier version of this client had
+                                     # NO grace period here at all (injects immediately) and
+                                     # didn't have this crash, because what was actually unsafe
+                                     # wasn't the injection itself but the startup mission-
+                                     # completion sweep making real remote calls into the game
+                                     # before a Pawn existed. Left at 12.0 anyway as a harmless
+                                     # secondary margin, not because it's confirmed necessary -
+                                     # if it turns out to just be pure added delay with no
+                                     # stability benefit, lowering it back down is reasonable.
+PAWN_STABILITY_ATTEMPTS = 15       # max get_pawn polls before giving up on the startup sweep
+PAWN_STABILITY_MATCHES = 3         # consecutive identical non-null pawn reads required
+PAWN_STABILITY_POLL_INTERVAL = 0.5 # seconds between polls (~7.5s worst case before giving up)
 DEATH_LINK_COOLDOWN = 10.0
 
 # Separate logger/tab for "what's happening in the game right now" (zone,
@@ -352,31 +422,42 @@ GIVE_SAFE_MAX_RETRIES = 12  # * ITEM_GRANT_RETRY_COOLDOWN (5s) = 1 minute total 
                              # forever in the background.
 
 
-def _attempt_give_safe(ctx):
-    """One attempt at /give_safe's grant. Returns (success, retryable,
-    message) - retryable=True for the specific TEMPORARY conditions
-    (loading screen, no Pawn, item_stash not yet stable, a power drop
-    that might just be transient loading-screen instability) that are
-    worth trying again shortly; False for anything else (no items in
-    the category, capacity full, etc - a real problem retrying won't
-    fix). Shared by the command's first attempt and the background
-    retry loop below so both follow identical logic."""
+def _give_safe_prepare(ctx):
+    """Phase 1 of /give_safe - everything that does NOT need the bridge
+    pipe (loading check, pawn, waiting for a stable item_stash - the
+    latter can take up to LOADING_MAX_WAIT seconds). Kept separate so it
+    can run WITHOUT holding ctx.bridge_pipe_lock: holding the pipe lock
+    through a long memory-only wait would stall every other pipe user
+    (chest polling, real item grants) for nothing.
+
+    Returns (failure, item_stash, item_stash_class) where failure is
+    either None (proceed) or a ready-made (success, retryable, message)
+    tuple."""
     pm, base = ctx.pm, ctx.base
 
     if ctx.currently_loading:
-        return False, True, ("Refusing to grant: a zone transition/loading screen is in progress "
-                              "right now. This is exactly the window where a write can silently "
-                              "corrupt the inventory - will retry automatically in a few seconds.")
+        return (False, True, ("Refusing to grant: a zone transition/loading screen is in progress "
+                               "right now. This is exactly the window where a write can silently "
+                               "corrupt the inventory - will retry automatically in a few seconds.")), None, None
 
     _, pawn_error = get_pawn(pm, base)
     if pawn_error:
-        return False, True, (f"Refusing to grant: player isn't in a level right now ({pawn_error}). "
-                              f"Will retry automatically in a few seconds.")
+        return (False, True, (f"Refusing to grant: player isn't in a level right now ({pawn_error}). "
+                               f"Will retry automatically in a few seconds.")), None, None
 
     try:
         item_stash, item_stash_class = wait_for_stable_item_stash(pm, base)
     except RuntimeError as e:
-        return False, True, f"Refusing to grant: {e} Will retry automatically in a few seconds."
+        return (False, True, f"Refusing to grant: {e} Will retry automatically in a few seconds."), None, None
+
+    return None, item_stash, item_stash_class
+
+
+def _give_safe_grant(ctx, item_stash, item_stash_class):
+    """Phase 2 of /give_safe - the part that actually uses the bridge
+    pipe. MUST be called with ctx.bridge_pipe_lock held (see
+    _attempt_give_safe_async). Returns (success, retryable, message)."""
+    pm = ctx.pm
 
     import win32file
     pipe = _connect_bridge_pipe(pm)
@@ -401,6 +482,59 @@ def _attempt_give_safe(ctx):
         win32file.CloseHandle(pipe)
 
 
+def _attempt_give_safe(ctx):
+    """One attempt at /give_safe's grant, fully synchronous (both phases
+    back to back, no locking) - kept for any direct/CLI caller. The
+    client's own command uses _attempt_give_safe_async below instead.
+    Returns (success, retryable, message) - retryable=True for the
+    specific TEMPORARY conditions (loading screen, no Pawn, item_stash
+    not yet stable, a power drop that might just be transient
+    loading-screen instability) that are worth trying again shortly;
+    False for anything else (no items in the category, capacity full,
+    etc - a real problem retrying won't fix)."""
+    failure, item_stash, item_stash_class = _give_safe_prepare(ctx)
+    if failure:
+        return failure
+    return _give_safe_grant(ctx, item_stash, item_stash_class)
+
+
+async def _attempt_give_safe_async(ctx):
+    """What /give_safe actually runs. Both phases go through
+    asyncio.to_thread so the event loop (chest polling, the AP websocket
+    connection itself) is NEVER blocked - /give_safe used to run
+    synchronously right on the event loop, where a slow
+    wait_for_stable_item_stash (up to LOADING_MAX_WAIT = 120s) froze the
+    whole client. Only phase 2 holds ctx.bridge_pipe_lock, so it can't
+    overlap the per-tick pipe polling or a real item grant (the pipe is
+    single-instance - see ctx.bridge_pipe_lock). Any pipe/OS error is
+    turned into a normal retryable failure message instead of an
+    unhandled exception (which used to surface only as asyncio's
+    "Task exception was never retrieved")."""
+    try:
+        failure, item_stash, item_stash_class = await asyncio.to_thread(_give_safe_prepare, ctx)
+        if failure:
+            return failure
+        async with ctx.bridge_pipe_lock:
+            return await asyncio.to_thread(_give_safe_grant, ctx, item_stash, item_stash_class)
+    except Exception as e:
+        return False, True, (f"give_safe hit an error talking to the game ({type(e).__name__}: {e}) - "
+                              f"will retry automatically in a few seconds.")
+
+
+async def _drain_mission_outcome_events_locked(ctx):
+    """Fire-and-forget helper for the "discard stale outcome events on a
+    fresh mission attempt" drain in game_watcher - the result is
+    discarded either way, but the pipe call itself still needs
+    ctx.bridge_pipe_lock like every other call site (single-instance
+    pipe), which a bare asyncio.create_task(asyncio.to_thread(...))
+    can't provide on its own."""
+    try:
+        async with ctx.bridge_pipe_lock:
+            await asyncio.to_thread(get_mission_outcome_events, ctx.pm)
+    except Exception:
+        pass
+
+
 async def _retry_give_safe_until_done(ctx, output):
     """Background retry loop for a /give_safe call that failed for a
     retryable (temporary) reason - keeps trying every
@@ -414,11 +548,20 @@ async def _retry_give_safe_until_done(ctx, output):
         if not ctx.pm or not ctx.base:
             output("give_safe retry stopped: no longer attached to Dungeons.exe.")
             return
-        success, retryable, message = _attempt_give_safe(ctx)
+        success, retryable, message = await _attempt_give_safe_async(ctx)
         output(f"[give_safe retry {attempt}/{GIVE_SAFE_MAX_RETRIES}] {message}")
         if success or not retryable:
             return
     output(f"give_safe: gave up after {GIVE_SAFE_MAX_RETRIES} retries - try the command again by hand.")
+
+
+async def _run_give_safe(ctx, output):
+    """Body of the /give_safe command (runs as its own task - the command
+    handler itself is synchronous and must return immediately)."""
+    success, retryable, message = await _attempt_give_safe_async(ctx)
+    output(message)
+    if not success and retryable:
+        await _retry_give_safe_until_done(ctx, output)
 
 
 class MCDungeonsCommandProcessor(ClientCommandProcessor):
@@ -448,6 +591,13 @@ class MCDungeonsCommandProcessor(ClientCommandProcessor):
             gs = self.ctx.game_state
             self.output(f"Game attached: {gs['attached']}")
             self.output(f"Zone: {gs['zone']}")
+            if self.ctx.pawn_present is None:
+                self.output("Character: not checked yet")
+            elif self.ctx.pawn_present:
+                self.output(f"Character: present (for {time.time() - self.ctx.pawn_state_since:.0f}s)")
+            else:
+                self.output(f"Character: ABSENT - {self.ctx.pawn_last_reason} "
+                             f"(for {time.time() - self.ctx.pawn_state_since:.0f}s)")
             if gs["health"] is not None:
                 self.output(f"Health: {gs['health']:.0f}/{gs['max_health']:.0f}")
             self.output(f"Boss kills claimed: {len(self.ctx.boss_kills_claimed)}")
@@ -463,6 +613,42 @@ class MCDungeonsCommandProcessor(ClientCommandProcessor):
         if isinstance(self.ctx, MCDungeonsContext):
             self.ctx.debug_interact_logging = not self.ctx.debug_interact_logging
             self.output(f"Interact debug logging: {'ON' if self.ctx.debug_interact_logging else 'OFF'}")
+
+    def _cmd_void(self, mode: str = ""):
+        """Devtool - DO NOT TOUCH, changing it can crash the game"""
+        if not isinstance(self.ctx, MCDungeonsContext) or getattr(self.ctx, "pm", None) is None:
+            self.output("Not attached to the game yet.")
+            return
+        mode = mode.strip().lower()
+        if mode not in ("", "soft", "hard"):
+            self.output("WARNING: devtool - do not touch, changing the void mode can crash the game.")
+            self.output("Usage: /void [soft|hard]   (no argument = show current state)")
+            self.output("  soft: hook stays patched in, does nothing during transitions")
+            self.output("  hard (default): ProcessEvent is physically unpatched for the whole transition window")
+            return
+        ok, resp = bridge_void_mode(self.ctx.pm, mode or None)
+        if ok and mode:
+            save_void_mode(mode)   # remembered for the next launches
+            self.output("WARNING: devtool - changing the void mode can crash the game. "
+                        "Set it back to 'hard' (the default) if you are not sure.")
+        self.output(f"Void mode: {resp}" if ok else f"Void mode request failed: {resp}")
+
+    def _cmd_set_store(self, channel: str = ""):
+        """devtool set store (steam/minecraft_launcher/microsoft_store)"""
+        if not channel:
+            self.output(f"Usage: /set_store <{'|'.join(STORE_OFFSETS)}>")
+            self.output(f"Currently set to: '{GAME_STORE}' (takes effect on next launch)")
+            return
+        if channel not in STORE_OFFSETS:
+            self.output(f"Unknown store '{channel}' - must be one of {list(STORE_OFFSETS)}")
+            return
+        save_game_store(channel)
+        self.output(f"Store set to '{channel}'. Restart the client (and the game/DLL) "
+                     f"for it to take effect.")
+        if channel != "steam":
+            self.output("NOTE: this channel's offsets are still UNCONFIRMED placeholders "
+                         "copied from steam - a fresh Dumper-7 dump for this build is "
+                         "needed to actually calibrate them.")
 
     def _cmd_reset_progress(self):
         """Safety feature if a chest is skipped - shouldn't happen normally"""
@@ -482,13 +668,11 @@ class MCDungeonsCommandProcessor(ClientCommandProcessor):
             self.output("Not attached to Dungeons.exe yet.")
             return
 
-        success, retryable, message = _attempt_give_safe(ctx)
-        self.output(message)
-        if not success and retryable:
-            asyncio.create_task(
-                _retry_give_safe_until_done(ctx, self.output),
-                name="GiveSafeRetry",
-            )
+        # Runs as a background task: the command handler itself is
+        # synchronous, and the grant (memory waits + pipe round trips)
+        # must never run on - and freeze - the event loop.
+        self.output("give_safe: working on it...")
+        async_start(_run_give_safe(ctx, self.output), name="GiveSafe")
 
 
 class MCDungeonsContext(CommonContext):
@@ -559,6 +743,17 @@ class MCDungeonsContext(CommonContext):
         # per-run tracking, not persisted
         self.last_mission_zone = None
         self.last_locked_zone_warned = None
+        # A level-lock kill (or an incoming DeathLink kill) that was refused
+        # because the bridge hook was silent / a loading screen was active is
+        # retried instead of being dropped - see the tick loop.
+        self.pending_lock_kill_zone = None
+        self.pending_lock_kill_until = 0.0
+        # The player has several lives (totems), so ONE kill only costs a life:
+        # the lock keeps killing - with a respawn wait in between - until the
+        # player has actually left the zone (or the caps below are hit).
+        self.lock_kill_count = 0
+        self.lock_kill_next_at = 0.0
+        self.deathlink_kill_retry_until = 0.0
         # set when a mission-outcome trigger fires and we're waiting on the
         # one-shot IsMissionCompleted() confirm call to resolve it; cleared
         # on a definitive True/False, and reset to None the moment a NEW
@@ -605,6 +800,15 @@ class MCDungeonsContext(CommonContext):
         # rather than trying to further tighten a race that can't
         # actually be closed by narrowing timing windows alone.
         self.currently_loading = False
+        # Character (Pawn) presence tracking - see _track_pawn_presence.
+        # pawn_present is None until the first debounced reading after an
+        # attach, then True/False. Purely informational: nothing gates on
+        # these fields, the real guards still call get_pawn themselves.
+        self.pawn_present = None
+        self.pawn_state_since = None      # time.time() the current state was first announced
+        self.pawn_last_reason = ""        # get_pawn's error string while absent
+        self.pawn_candidate = None        # last raw reading (True/False), not yet announced
+        self.pawn_candidate_count = 0
         self.progressive_pickups_unlocked = False  # set once per attach, see game_watcher
         self.pending_emerald_grants = []  # [(absolute_index, amount), ...] - not yet applied
                                            # in-game (not attached yet, or the write failed);
@@ -631,6 +835,17 @@ class MCDungeonsContext(CommonContext):
         # since they're all polled repeatedly anyway and pick back up
         # normally the moment the grant finishes.
         self.item_grant_pipe_busy = False
+
+        # THE real mutual exclusion for dungeons_bridge.dll's named pipe
+        # (nMaxInstances=1 in dungeons_bridge.cpp: only ONE client
+        # connection can exist at a time, any other attempt gets
+        # ERROR_PIPE_BUSY). Every coroutine that touches the pipe through
+        # asyncio.to_thread - the per-tick chest/death/outcome/pickup-tier
+        # polling, real AP item grants, and /give_safe - takes this lock
+        # around the call, so two of them can never overlap.
+        # item_grant_pipe_busy above stays as a cheap "skip this tick"
+        # hint only; this lock is what actually guarantees exclusion.
+        self.bridge_pipe_lock = asyncio.Lock()
 
         # Set right after we kill the local player OURSELVES
         # (level-lock enforcement, or a DeathLink we just received) -
@@ -691,6 +906,28 @@ class MCDungeonsContext(CommonContext):
             self._on_package(cmd, args)
         except Exception as e:
             game_logger.info(f"on_package error handling {cmd} (continuing): {e}")
+
+    async def _inject_on_connect(self):
+        """Backgrounded body for the on-connect (re-)injection - see the
+        call site's comment in _on_package for why this can't run
+        synchronously there. self.pm is re-read here (not passed in)
+        since some time may pass between scheduling this and it actually
+        running; if it went from attached to None in that window, there's
+        nothing to inject into anymore and this just quietly returns,
+        same as the original inline check did."""
+        if self.pm is None:
+            return
+        try:
+            inject_error = await asyncio.to_thread(_ensure_bridge_dll_injected, self.pm.process_id)
+        except Exception as e:
+            inject_error = f"{type(e).__name__}: {e}"
+        if inject_error == GAME_GONE_MESSAGE:
+            game_logger.info(GAME_GONE_MESSAGE)
+        elif inject_error:
+            game_logger.info(f"dungeons_bridge.dll injection on connect failed ({inject_error}) - "
+                              f"boss kills, chests, and emeralds may not work until this succeeds.")
+        else:
+            game_logger.info("dungeons_bridge.dll confirmed injected (or already was) on connect.")
 
     def _on_package(self, cmd: str, args: dict):
         if cmd == "RoomInfo":
@@ -776,15 +1013,20 @@ class MCDungeonsContext(CommonContext):
             # inject INTO yet and game_watcher's own attach-loop injection
             # will cover it once attach succeeds.
             if self.pm is not None:
-                try:
-                    inject_error = _ensure_bridge_dll_injected(self.pm.process_id)
-                except Exception as e:
-                    inject_error = f"{type(e).__name__}: {e}"
-                if inject_error:
-                    game_logger.info(f"dungeons_bridge.dll injection on connect failed ({inject_error}) - "
-                                      f"boss kills, chests, and emeralds may not work until this succeeds.")
-                else:
-                    game_logger.info("dungeons_bridge.dll confirmed injected (or already was) on connect.")
+                # Backgrounded via async_start + asyncio.to_thread - NOT
+                # called directly here. _on_package is a SYNCHRONOUS method
+                # (called from the AP client library's packet dispatch), and
+                # _ensure_bridge_dll_injected does blocking Windows API calls
+                # (OpenProcess/inject) with no guaranteed-short runtime.
+                # Calling it directly here blocks whatever thread dispatches
+                # packets - confirmed via a real traced session: a "Lost
+                # connection to the multiworld server... keepalive ping
+                # timeout" that lined up exactly with this call, not a
+                # coincidence. Same class of bug as the other pipe/injection
+                # calls fixed elsewhere in this file - unthreaded blocking
+                # calls on a path that also needs to keep the AP connection
+                # alive.
+                async_start(self._inject_on_connect())
 
             async_start(self.update_death_link(bool(self.slot_data.get("death_link", True))),
                         name="set DeathLink tag")
@@ -988,11 +1230,17 @@ class MCDungeonsContext(CommonContext):
         if self.pm and self.base:
             self.suppress_death_link_until = time.time() + self.SUPPRESS_DEATH_LINK_WINDOW
             source = data.get("source") or "Someone"
+            if self.currently_loading:
+                # No engine call during a loading screen - retried from the tick loop.
+                self.deathlink_kill_retry_until = time.time() + 20.0
+                game_logger.info(f"{source} died - loading screen in progress, will apply the kill right after.")
+                return
             success, kill_error, diag = kill_local_player(self.pm, self.base)
             if success:
                 game_logger.info(f"{source} died (chain={diag.get('chain')}).")
             else:
-                game_logger.info(f"{source} died - could not kill local player: {kill_error}")
+                self.deathlink_kill_retry_until = time.time() + 20.0
+                game_logger.info(f"{source} died - could not kill local player yet: {kill_error} (will retry).")
 
     def make_gui(self):
         # Documented extension point (see CommonContext.make_gui's own
@@ -1004,11 +1252,30 @@ class MCDungeonsContext(CommonContext):
         from kvui import GameManager
 
         class MCDungeonsManager(GameManager):
+            # The old "Game" log tab (MCDungeonsGame) was replaced by the
+            # "Map" tab below. game_logger still logs, it just isn't shown
+            # in the window any more - to bring it back, add
+            # ("MCDungeonsGame", "Game") to this list.
             logging_pairs = [
                 ("Client", "Archipelago"),
-                ("MCDungeonsGame", "Game"),
             ]
             base_title = "Minecraft Dungeons Client"
+
+            def build(self):
+                container = super().build()
+                try:
+                    from map_tab import MapTab
+                    tab = MapTab(self.ctx)
+                    if hasattr(self, "add_client_tab"):
+                        self.add_client_tab("Map", tab)
+                    else:  # older Archipelago builds without add_client_tab
+                        from kivy.uix.tabbedpanel import TabbedPanelItem
+                        item = TabbedPanelItem(text="Map")
+                        item.add_widget(tab)
+                        self.tabs.add_widget(item)
+                except Exception:
+                    logging.getLogger("Client").exception("Map tab failed to load")
+                return container
 
         return MCDungeonsManager
 
@@ -1019,6 +1286,108 @@ class MCDungeonsContext(CommonContext):
 # using ctx.check_locations (async, CommonContext-native) instead of a raw
 # ArchipelagoClient.send_location_checks call.
 # ---------------------------------------------------------------------------
+
+# --- void mode (how the DLL empties itself during level transitions) ---------
+# Live-tested: with "soft" (hook stays patched in, does nothing) the game crashed
+# on the very first hub -> mission transition; with "hard" (ProcessEvent is
+# physically unpatched for the whole transition window) nine transitions in a
+# row - including a mission victory and two locked-mission kills - went through,
+# and /void hard no longer crashes the game. So "hard" is the default. The DLL
+# always starts in "soft" (its mode is per process), so the client pushes the
+# saved mode right after injection (void_mode.txt remembers /void's choice).
+# Findings behind the current design:
+#   * the hook must not be PATCHED into the game while the engine is still
+#     booting (early injection is fine; the DLL waits for a stable first
+#     GWorld before installing it - see WaitForEngineBoot in the DLL);
+#   * during a transition the safest state is the one where nothing of ours is
+#     in the game's code at all (hard void), not merely a hook that forwards;
+#   * a client-side "force the hook silent at mission end" (/endsilence) was
+#     tried and removed: hard mode's own world-change silence already carried
+#     mission victories and locked-mission kills without it.
+VOID_MODE_FILE = DATA_DIR / "void_mode.txt"
+VOID_MODE_DEFAULT = "hard"
+
+
+def load_void_mode() -> str:
+    try:
+        mode = VOID_MODE_FILE.read_text(encoding="utf-8").strip().lower()
+        if mode in ("soft", "hard"):
+            return mode
+    except Exception:
+        pass
+    return VOID_MODE_DEFAULT
+
+
+def save_void_mode(mode: str) -> None:
+    try:
+        VOID_MODE_FILE.write_text(mode, encoding="utf-8")
+    except Exception as e:
+        game_logger.info(f"Could not save the void mode preference: {e}")
+
+
+async def apply_saved_void_mode(ctx):
+    """Pushes the saved void mode to the DLL. Retries for up to 60 s because the
+    DLL's pipe only exists once it has finished loading inside the game.
+
+    Also the client's check that an injection really took: the DLL opens its
+    pipe within a moment of being loaded, so a pipe that stays missing means
+    the DLL is not (or no longer) in this process. After a few seconds of that
+    the process is inspected and, if it is alive but the DLL is absent, the DLL
+    is sent again (twice at most) - so a relaunched game never silently stays
+    without the bridge."""
+    import auto_inject
+    mode = load_void_mode()
+    started = time.monotonic()
+    deadline = started + 60.0
+    last_err = ""
+    reinjections = 0
+    next_check = started + 8.0
+    while time.monotonic() < deadline:
+        pm = getattr(ctx, "pm", None)
+        if pm is None:
+            return
+        try:
+            async with ctx.bridge_pipe_lock:
+                ok, resp = await asyncio.to_thread(bridge_void_mode, pm, mode)
+        except Exception as e:
+            ok, resp = False, str(e)
+        if ok:
+            game_logger.info(f"Void mode set to '{mode}' (anti-crash transition safety).")
+            return
+        last_err = str(resp)
+
+        if time.monotonic() >= next_check:
+            next_check = time.monotonic() + 8.0
+            pid = pm.process_id
+            alive = auto_inject.is_process_alive(pid)
+            loaded = alive and auto_inject.is_dll_loaded(pid, auto_inject.DLL_NAME)
+            if not alive:
+                return   # the watcher reports the dead game and re-attaches on its own
+            if not loaded and reinjections < 2:
+                reinjections += 1
+                game_logger.info(f"dungeons_bridge.dll is not loaded in {_game_process_name()} (PID {pid}) - "
+                                  f"sending it again (attempt {reinjections}/2).")
+                try:
+                    err = await asyncio.to_thread(_ensure_bridge_dll_injected, pid)
+                except Exception as e:
+                    err = f"{type(e).__name__}: {e}"
+                if err:
+                    game_logger.info(f"Re-injection failed: {err}")
+                    if err == GAME_GONE_MESSAGE:
+                        return
+            elif loaded:
+                game_logger.info(f"dungeons_bridge.dll is loaded in PID {pid} but its pipe is not "
+                                  f"answering yet ({last_err}) - still waiting.")
+        await asyncio.sleep(1.5)
+    game_logger.info(f"Could not set the void mode to '{mode}' ({last_err}) - the DLL keeps its own default. "
+                      f"Check dungeons_bridge_debug.log (next to the DLL): a fresh "
+                      f"'SetupHookThread starting' line means the DLL did load in the new game process.")
+
+
+# --- level lock: keep killing until the player is out of the locked zone -----
+LOCK_KILL_WINDOW_S = 120.0        # total time the lock keeps enforcing (was 60 s, single kill)
+LOCK_KILL_RESPAWN_WAIT_S = 4.0    # pause after a kill so the respawn can complete
+LOCK_KILL_MAX_KILLS = 10          # hard cap - more than any lives count
 
 async def fire_mission_complete(ctx: MCDungeonsContext, zone_name: str):
     """Sends this zone's Mission Complete check - "already sent" is
@@ -1065,13 +1434,28 @@ async def fire_chest_open(ctx: MCDungeonsContext, zone_name: str, kind: str):
     total = ZONE_CHEST_COUNTS[zone_name][0 if kind == "chest" else 1]
     location_id_fn = (_apw.get_zone_chest_location_id if kind == "chest"
                        else _apw.get_zone_supply_chest_location_id)
-    already = sum(1 for n in range(1, total + 1) if location_id_fn(zone_name, n) in ctx.checked_locations)
+    # IDs sent a moment ago that the server hasn't acknowledged yet: without
+    # this, two opens processed before the ack would both target the same
+    # "next" location. Entries drop as soon as the server confirms them, or
+    # after 10 s (so a send lost to a disconnect can never block a chest).
+    _now = time.time()
+    _pend = getattr(ctx, "_pending_chest_ids", None)
+    if _pend is None:
+        _pend = ctx._pending_chest_ids = {}
+    for _lid in [l for l, t in _pend.items() if l in ctx.checked_locations or _now - t > 10.0]:
+        del _pend[_lid]
+
+    def _claimed(lid):
+        return lid in ctx.checked_locations or lid in _pend
+
+    already = sum(1 for n in range(1, total + 1) if _claimed(location_id_fn(zone_name, n)))
 
     if already < total:
         next_num = already + 1
         location_id = location_id_fn(zone_name, next_num)
         location_name = (_apw.zone_chest_location_name(zone_name, next_num) if kind == "chest"
                           else _apw.zone_supply_chest_location_name(zone_name, next_num))
+        _pend[location_id] = time.time()
         await ctx.check_locations([location_id])
         game_logger.info(f"Chest: {location_name}")
         return
@@ -1083,10 +1467,11 @@ async def fire_chest_open(ctx: MCDungeonsContext, zone_name: str, kind: str):
     claimed["global:extra_count"] = extra_count
     save_claimed_zone_chests(claimed)
 
-    bonus_already = sum(1 for n in range(1, limit + 1) if _apw.get_bonus_chest_location_id(n) in ctx.checked_locations)
+    bonus_already = sum(1 for n in range(1, limit + 1) if _claimed(_apw.get_bonus_chest_location_id(n)))
     if bonus_already >= limit:
         return
     bonus_num = bonus_already + 1
+    _pend[_apw.get_bonus_chest_location_id(bonus_num)] = time.time()
     await ctx.check_locations([_apw.get_bonus_chest_location_id(bonus_num)])
     game_logger.info(f"Bonus chest: {_apw.bonus_chest_location_name(bonus_num)} "
                       f"(extra #{extra_count} globally, found in {zone_name})")
@@ -1219,7 +1604,8 @@ async def _apply_next_pending_item_grant(ctx: MCDungeonsContext, pm, base):
             ctx.item_grant_pipe_busy = False
 
     try:
-        item_name_index, granted_name, power = await asyncio.to_thread(_do_grant)
+        async with ctx.bridge_pipe_lock:
+            item_name_index, granted_name, power = await asyncio.to_thread(_do_grant)
         game_logger.info(f"Item reward: {item_name} -> granted {granted_name} "
                           f"(power={power:.1f}, reward #{absolute_index}).")
         ctx.applied_reward_indices.add(absolute_index)
@@ -1279,6 +1665,57 @@ async def _check_and_maybe_send_goal(ctx: MCDungeonsContext) -> None:
     await ctx.send_msgs([{"cmd": "StatusUpdate", "status": 30}])
 
 
+def _reset_pawn_tracking(ctx):
+    """Forget the last announced character state - called on every fresh
+    attach so the first reading after a (re)attach is always announced."""
+    ctx.pawn_present = None
+    ctx.pawn_state_since = None
+    ctx.pawn_last_reason = ""
+    ctx.pawn_candidate = None
+    ctx.pawn_candidate_count = 0
+
+
+def _track_pawn_presence(ctx, pawn, error):
+    """Logs when the player's character (Pawn) appears or disappears.
+    `pawn`/`error` are get_pawn's own return values - error is its
+    human-readable reason for the absence (\"No UWorld\", \"No Pawn -
+    character not spawned yet?\", ...), which is logged as-is so the
+    message says WHICH link of the chain is missing.
+
+    A change is only announced after PAWN_ANNOUNCE_DEBOUNCE identical
+    readings in a row (0.4s at the normal tick rate), so one transient
+    bad read doesn't produce a detected/absent flicker. Informational
+    only: nothing in the client gates on this - every real guard still
+    calls get_pawn itself at the moment it acts."""
+    present = bool(pawn) and not error
+    if present == ctx.pawn_candidate:
+        ctx.pawn_candidate_count += 1
+    else:
+        ctx.pawn_candidate = present
+        ctx.pawn_candidate_count = 1
+    if not present:
+        ctx.pawn_last_reason = error or "unknown"
+
+    if ctx.pawn_candidate_count < PAWN_ANNOUNCE_DEBOUNCE or present == ctx.pawn_present:
+        return
+
+    now = time.time()
+    previous = ctx.pawn_present
+    since = ctx.pawn_state_since
+    ctx.pawn_present = present
+    ctx.pawn_state_since = now
+    if present:
+        if previous is False and since is not None:
+            game_logger.info(f"Character DETECTED (pawn 0x{pawn:X}) - was absent for {now - since:.1f}s.")
+        else:
+            game_logger.info(f"Character DETECTED (pawn 0x{pawn:X}).")
+    else:
+        if previous is True and since is not None:
+            game_logger.info(f"Character ABSENT: {ctx.pawn_last_reason} - was present for {now - since:.1f}s.")
+        else:
+            game_logger.info(f"Character ABSENT: {ctx.pawn_last_reason}")
+
+
 async def game_watcher(ctx: MCDungeonsContext):
     """The main per-tick loop - runs as its own asyncio task alongside
     CommonContext's server/UI tasks, replacing the old client's blocking
@@ -1303,6 +1740,7 @@ async def game_watcher(ctx: MCDungeonsContext):
     # a dead handle doesn't reliably raise) means a relaunch is instead
     # just... a second pass through the exact same attach logic that
     # handled "open the client before the game" in the first place.
+    last_attached_pid = None
     while not ctx.exit_event.is_set():
         # Attach retry loop - the old client called attach() once at
         # startup and crashed hard if Dungeons.exe wasn't running yet.
@@ -1313,13 +1751,41 @@ async def game_watcher(ctx: MCDungeonsContext):
             try:
                 ctx.pm, ctx.base = attach()
                 ctx.game_state["attached"] = True
-                game_logger.info("Attached to Dungeons.exe.")
+                _reset_pawn_tracking(ctx)
+                game_logger.info(f"Attached to {_game_process_name()}.")
             except Exception as e:
-                game_logger.info(f"Waiting for Dungeons.exe... ({e})")
+                game_logger.info(f"Waiting for {_game_process_name()}... ({e})")
                 await asyncio.sleep(ATTACH_RETRY_INTERVAL)
 
         if ctx.exit_event.is_set():
             break
+
+        # Startup grace period, for a genuinely NEW process only (pid
+        # differs from the last one we attached to) - attach() (via
+        # pick_target_pid) succeeds the instant Dungeons.exe shows up in
+        # the process list, which can be well before the game itself has
+        # finished its own startup (module fully loaded, D3D device
+        # created, etc). Traced a real "client launched before the game -
+        # crashes; game launched before the client - fine" report to
+        # exactly this: injecting (VirtualAllocEx/CreateRemoteThread) into
+        # a process that's still THAT early in its own initialization is
+        # inherently more fragile than injecting into one that's already
+        # been running a while, which is what "launch the game first"
+        # effectively gives you for free. Giving the game the same head
+        # start here removes the need to rely on launch order at all.
+        if ctx.pm.process_id != last_attached_pid:
+            last_attached_pid = ctx.pm.process_id
+            # Grace period disabled (0.0): A/B testing showed injecting after a
+            # delay crashed the "client before game" scenario reproducibly while
+            # injecting immediately never did. The DLL now protects its own
+            # startup window instead: it is loaded at once but does NOT patch
+            # ProcessEvent until the engine's first GWorld has been stable for
+            # a few seconds (WaitForEngineBoot), and from then on the void
+            # controller handles every level transition - see dungeons_bridge.cpp.
+            if PROCESS_STARTUP_GRACE_PERIOD > 0:
+                game_logger.info("New Dungeons.exe process - giving it a few seconds to finish "
+                                  "starting up before injecting.")
+                await asyncio.sleep(PROCESS_STARTUP_GRACE_PERIOD)
 
         pm, base = ctx.pm, ctx.base
 
@@ -1355,23 +1821,68 @@ async def game_watcher(ctx: MCDungeonsContext):
                               f"Try running as administrator.")
         else:
             game_logger.info("dungeons_bridge.dll injected (or already was).")
+            asyncio.create_task(apply_saved_void_mode(ctx), name="ApplySavedVoidMode")
 
         # Startup catch-up sweeps - grant anything already true on this hero
         # before this session started (e.g. missions finished, or emeralds
         # already past a milestone, while nothing was watching). Same as the
         # pre-rewrite client's identical sweep, just done once here instead
         # of before entering its while-loop.
-        if IS_MISSION_COMPLETED_INDEX is not None:
+        #
+        # Gated on the player pawn actually existing/stable first.
+        # call_is_mission_completed makes a real remote call into the game
+        # for every zone - doing that immediately after injection, before a
+        # World/GameInstance/PlayerController/Pawn chain is even up, is
+        # exactly the kind of "touching the game too early in its own
+        # startup" that's been linked to real crashes in this project - this
+        # is the confirmed fix for the "client already running/connected
+        # before the game was launched -> crash shortly after injection"
+        # history (a fixed-delay grace period on injection timing alone was
+        # NOT sufficient - the sweep below is what actually needed to wait).
+        # Polls get_pawn a few times rather than trusting a single read,
+        # since a transient miss right at startup (loading screen, hub not
+        # fully spawned in yet) shouldn't be mistaken for "no character
+        # exists at all" - requires PAWN_STABILITY_MATCHES consecutive
+        # identical non-null reads before treating the pawn as real. Skips
+        # the sweep entirely (not a crash, not a retry-forever) if it never
+        # stabilizes in time - individual mission completions are still
+        # caught live via the normal poll loop once a real pawn does show
+        # up, so nothing is permanently missed, just not backfilled from
+        # before this session started.
+        pawn_stable = False
+        last_pawn = None
+        stable_count = 0
+        for _ in range(PAWN_STABILITY_ATTEMPTS):
+            pawn, _err = await asyncio.to_thread(get_pawn, pm, base)
+            if pawn and pawn == last_pawn:
+                stable_count += 1
+                if stable_count >= PAWN_STABILITY_MATCHES:
+                    pawn_stable = True
+                    break
+            else:
+                stable_count = 0
+            last_pawn = pawn
+            await asyncio.sleep(PAWN_STABILITY_POLL_INTERVAL)
+
+        if not pawn_stable:
+            game_logger.info("Pawn never stabilized - skipping the mission-completion "
+                              "catch-up sweep this session (individual completions will "
+                              "still be caught live as they happen).")
+        elif IS_MISSION_COMPLETED_INDEX is not None:
             game_logger.info("Checking existing mission completion state...")
             for zone_name in MISSION_LOCATION_IDS:
                 if zone_name in ctx.known_mission_completed:
                     continue
-                if call_is_mission_completed(pm, base, zone_name) is True:
+                # Threaded - same missing-read-timeout risk as the other
+                # pipe calls fixed elsewhere in this file.
+                if await asyncio.to_thread(call_is_mission_completed, pm, base, zone_name) is True:
                     ctx.known_mission_completed.add(zone_name)
                     await fire_mission_complete(ctx, zone_name)
 
         if getattr(ctx, "slot_data", {}).get("emerald_goal"):
-            current_emeralds, _err = read_current_emeralds(pm, base)
+            # Real remote call into the game (remote thread, blocks until it
+            # returns) - off the event loop like every other such call.
+            current_emeralds, _err = await asyncio.to_thread(read_current_emeralds, pm, base)
             if current_emeralds is not None:
                 if update_emerald_earned_total(ctx.emerald_earned_state, current_emeralds):
                     save_emerald_earned_state(ctx.emerald_earned_state)
@@ -1426,18 +1937,36 @@ async def game_watcher(ctx: MCDungeonsContext):
             # the client itself restarted.
             import auto_inject
             if not auto_inject.is_process_alive(pm.process_id):
-                game_logger.info("Dungeons.exe is no longer running - waiting for it to relaunch...")
+                game_logger.info(f"{_game_process_name()} is no longer running - waiting for it to relaunch...")
+                try:
+                    pm.close_process()   # an open handle keeps the dead process listed
+                except Exception:
+                    pass
                 ctx.pm = None
                 ctx.base = None
                 ctx.game_state["attached"] = False
+                _reset_pawn_tracking(ctx)
                 break
+
+            # Character presence marker - one cheap get_pawn per tick, off
+            # the event loop like every other memory-touching call here.
+            # A raised read (dead handle, mid-teardown) counts as absent.
+            try:
+                _pawn_ptr, _pawn_err = await asyncio.to_thread(get_pawn, pm, base)
+            except Exception as _pawn_exc:
+                _pawn_ptr, _pawn_err = None, f"read failed ({type(_pawn_exc).__name__})"
+            _track_pawn_presence(ctx, _pawn_ptr, _pawn_err)
 
             try:
                 # progressive pickups: force-unlock once per attach if the option
                 # is off this seed (see the old client's identical comment on why
                 # this can't just be the DLL's own default).
                 if not ctx.progressive_pickups_unlocked and not bool(ctx.slot_data.get("progressive_pickups", False)):
-                    ok, tier_error = set_pickup_tier(pm, 3)
+                    # Threaded - see get_chest_open_events below for why:
+                    # win32file.ReadFile inside set_pickup_tier is a blocking
+                    # named-pipe read with no timeout.
+                    async with ctx.bridge_pipe_lock:
+                        ok, tier_error = await asyncio.to_thread(set_pickup_tier, pm, 3)
                     if ok:
                         ctx.progressive_pickups_unlocked = True
                         game_logger.info("Progressive pickups off this seed - all pickups unlocked.")
@@ -1447,7 +1976,9 @@ async def game_watcher(ctx: MCDungeonsContext):
                     # (from received "Progressive Pickup" items) into the game.
                     # Only retries while the applied/target tiers disagree, so
                     # this doesn't hit the bridge pipe every tick once caught up.
-                    ok, tier_error = set_pickup_tier(pm, ctx.progressive_pickup_tier)
+                    # Threaded for the same reason as above.
+                    async with ctx.bridge_pipe_lock:
+                        ok, tier_error = await asyncio.to_thread(set_pickup_tier, pm, ctx.progressive_pickup_tier)
                     if ok:
                         ctx.progressive_pickup_tier_applied = ctx.progressive_pickup_tier
 
@@ -1457,14 +1988,32 @@ async def game_watcher(ctx: MCDungeonsContext):
 
                 # --- boss kills (dungeons_bridge.dll OnCharacterDeath events) ---
                 if watch_boss_kills_enabled:
-                    for addr in (get_death_events(pm) or []):
+                    # Threaded - same reasoning as get_chest_open_events below:
+                    # runs every tick, unthreaded it's a live risk of freezing
+                    # the whole client (and its connection to the AP server)
+                    # on a stuck pipe read.
+                    async with ctx.bridge_pipe_lock:
+                        death_events = await asyncio.to_thread(get_death_events, pm) or []
+                    for addr in death_events:
                         boss_name = resolve_boss_for_actor(pm, addr)
                         if boss_name:
                             await fire_boss_kill(ctx, boss_name)
 
                 # zone chest events are drained here but attributed to a zone
                 # below, once this tick's current zone is actually known.
-                chest_events, chest_events_err = get_chest_open_events(pm)
+                #
+                # Threaded - NOT called directly. win32file.ReadFile inside
+                # get_chest_open_events is a blocking named-pipe read with NO
+                # TIMEOUT at all. This runs every tick; if the DLL ever fails
+                # to answer for any reason (a transient race, a busy pipe),
+                # an unthreaded call here hangs the entire client indefinitely
+                # - including outgoing AP server keepalives, which is exactly
+                # what produces a "Lost connection... keepalive ping timeout"
+                # disconnect with no exception or error message anywhere to
+                # explain why. Confirmed as a real bug via a traced session
+                # (same class of issue as the injection-on-connect fix above).
+                async with ctx.bridge_pipe_lock:
+                    chest_events, chest_events_err = await asyncio.to_thread(get_chest_open_events, pm)
                 chest_events = chest_events or []
                 if chest_events_err and time.time() - ctx.last_chest_error_log >= 10.0:
                     # This error was silently discarded before (chest_events
@@ -1523,6 +2072,7 @@ async def game_watcher(ctx: MCDungeonsContext):
                     if zone_name in ZONE_ID_ORDER:
                         ctx.last_mission_zone = zone_name
                         ctx.last_locked_zone_warned = None
+                        ctx.pending_lock_kill_zone = None
                         # New mission attempt starting. Anything still queued in
                         # the DLL's outcome-trigger buffer belongs to whatever
                         # run just ended (a finish/fail that fired but hasn't
@@ -1531,8 +2081,14 @@ async def game_watcher(ctx: MCDungeonsContext):
                         # fresh attempt. Combined with resetting
                         # pending_mission_outcome_zone, this run starts clean:
                         # nothing is considered completed until a genuine new
-                        # trigger + confirm happens for THIS attempt.
-                        get_mission_outcome_events(pm)
+                        # trigger + confirm happens for THIS attempt. Fire-
+                        # and-forget threaded - result is discarded either
+                        # way, no need to await it, but still shouldn't block
+                        # this tick on a potentially-stuck pipe read.
+                        asyncio.create_task(
+                            _drain_mission_outcome_events_locked(ctx),
+                            name="DrainMissionOutcomeEvents",
+                        )
                         ctx.pending_mission_outcome_zone = None
                         ctx.pending_mission_outcome_triggers = set()
                         ctx.gameover_trigger_pending = False
@@ -1633,8 +2189,42 @@ async def game_watcher(ctx: MCDungeonsContext):
                                    if not is_zone_truly_unlocked(z, ctx.unlocked_zones)]
                         game_logger.info(f"Locked mission '{zone_name}' - missing: {missing}")
                         ctx.last_locked_zone_warned = zone_name
+                        ctx.pending_lock_kill_zone = zone_name
+                        ctx.pending_lock_kill_until = time.time() + LOCK_KILL_WINDOW_S
+                        ctx.lock_kill_count = 0
+                        ctx.lock_kill_next_at = 0.0
+                    # The kill is attempted once loading is over and the bridge
+                    # hook is active; if it is refused (silent hook / loading)
+                    # it is retried for up to 60 s rather than skipped, so the
+                    # level lock can't be bypassed by a transition-timing miss.
+                    if (ctx.pending_lock_kill_zone == zone_name and not ctx.currently_loading
+                            and time.time() < ctx.pending_lock_kill_until
+                            and time.time() >= ctx.lock_kill_next_at):
                         ctx.suppress_death_link_until = time.time() + MCDungeonsContext.SUPPRESS_DEATH_LINK_WINDOW
-                        kill_local_player(pm, base)
+                        lock_kill_ok, _lock_kill_err, _lock_diag = kill_local_player(pm, base)
+                        if lock_kill_ok:
+                            ctx.lock_kill_count += 1
+                            # Wait for the respawn, then kill again if the player
+                            # is still in this zone (extra lives). The zone check
+                            # above stops it as soon as they are back in camp.
+                            ctx.lock_kill_next_at = time.time() + LOCK_KILL_RESPAWN_WAIT_S
+                            game_logger.info(f"Locked mission '{zone_name}': kill #{ctx.lock_kill_count} applied.")
+                            if ctx.lock_kill_count >= LOCK_KILL_MAX_KILLS:
+                                ctx.pending_lock_kill_zone = None
+                                game_logger.info(f"Locked mission '{zone_name}': stopped after "
+                                                  f"{LOCK_KILL_MAX_KILLS} kills.")
+
+                # --- delayed incoming-DeathLink kill (was refused during a
+                # loading screen / silent hook - see on_deathlink) ---
+                if ctx.deathlink_kill_retry_until and not ctx.currently_loading:
+                    if time.time() >= ctx.deathlink_kill_retry_until:
+                        ctx.deathlink_kill_retry_until = 0.0
+                    else:
+                        ctx.suppress_death_link_until = time.time() + MCDungeonsContext.SUPPRESS_DEATH_LINK_WINDOW
+                        dl_ok, _dl_err, _dl_diag = kill_local_player(pm, base)
+                        if dl_ok:
+                            ctx.deathlink_kill_retry_until = 0.0
+                            game_logger.info("Delayed DeathLink kill applied.")
 
                 # --- mission completion: event-driven, not polled -----------
                 # The DLL trigger (MulticastMissionFinished / OnShowMissionVictory
@@ -1656,7 +2246,11 @@ async def game_watcher(ctx: MCDungeonsContext):
                 # below, it doesn't need OFFSETS["mission_progress_component"]
                 # at all, which was never actually found. That's why this is
                 # checked first, not call_is_mission_completed.
-                outcome_events, _outcome_err = get_mission_outcome_events(pm)
+                # Threaded - same reasoning as get_chest_open_events above:
+                # this runs every tick, unthreaded it's a live risk of
+                # freezing the whole client on a stuck pipe read.
+                async with ctx.bridge_pipe_lock:
+                    outcome_events, _outcome_err = await asyncio.to_thread(get_mission_outcome_events, pm)
                 if outcome_events and ctx.last_mission_zone and ctx.last_mission_zone not in ctx.known_mission_completed:
                     for evt in outcome_events:
                         game_logger.info(f"Mission-outcome trigger ({evt.get('trigger_name', '?')}) for "
@@ -1719,7 +2313,8 @@ async def game_watcher(ctx: MCDungeonsContext):
                     elif "mission_progress_component" in OFFSETS and IS_MISSION_COMPLETED_INDEX is not None:
                         # Fallback path - only reachable once that offset is
                         # actually found and added (see find_mission_progress_component).
-                        result = call_is_mission_completed(pm, base, zone_to_confirm, debug_log=game_logger.info)
+                        # Remote call into the game - must not run on the event loop.
+                        result = await asyncio.to_thread(call_is_mission_completed, pm, base, zone_to_confirm)
                         if result is True:
                             ctx.known_mission_completed.add(zone_to_confirm)
                             await fire_mission_complete(ctx, zone_to_confirm)
@@ -1863,10 +2458,32 @@ async def game_watcher(ctx: MCDungeonsContext):
                 # (re-reading the balance a few seconds later to catch a
                 # zone-load reverting a raw memory write) is gone
                 # entirely now - there's nothing left for it to catch.
-                if ctx.pending_emerald_grants:
+                if ctx.pending_emerald_grants and not ctx.pawn_present:
+                    # Confirmed root cause of a permanent earned/actual gap: get_wallet_
+                    # component()'s own get_pawn() call is a single unstabilized read. In
+                    # the window before the player has actually picked their character
+                    # (still on the select/preview screen), it can resolve a transient
+                    # Pawn that already has a live WalletComponent - ClientAdd succeeds
+                    # against it, the reward gets marked applied (never retried), but
+                    # that transient Pawn/wallet doesn't survive into the real hub
+                    # character, so the emeralds never reach the actual save. total_earned
+                    # then tracks the real (now permanently short) balance faithfully,
+                    # which is exactly what makes the gap look "fixed" - it's not drift,
+                    # it's one grant that landed on a wallet that was thrown away.
+                    #
+                    # ctx.pawn_present is the SAME debounced signal every other grant
+                    # path (_apply_next_pending_item_grant et al.) already waits to
+                    # settle on - PAWN_ANNOUNCE_DEBOUNCE consecutive identical readings
+                    # before flipping - unlike a raw one-shot get_pawn() call. Simply not
+                    # attempting emerald grants until it reads True closes this window:
+                    # nothing is lost, the grant just waits one tick.
+                    game_logger.info(f"{len(ctx.pending_emerald_grants)} emerald grant(s) "
+                                      f"held back - character not confirmed present yet.")
+                elif ctx.pending_emerald_grants:
                     still_pending = []
                     for absolute_index, amount in ctx.pending_emerald_grants:
-                        success, err = apply_emerald_reward(pm, base, amount)
+                        # Remote call into the game - must not run on the event loop.
+                        success, err = await asyncio.to_thread(apply_emerald_reward, pm, base, amount)
                         if success:
                             ctx.applied_reward_indices.add(absolute_index)
                             save_applied_reward_indices(ctx.applied_reward_indices)
@@ -1898,7 +2515,7 @@ async def game_watcher(ctx: MCDungeonsContext):
                 # --- emerald milestones (throttled) ---
                 if ctx.slot_data.get("emerald_goal") and time.time() - ctx.last_emerald_poll >= EMERALD_POLL_INTERVAL:
                     ctx.last_emerald_poll = time.time()
-                    current_emeralds, _err = read_current_emeralds(pm, base)
+                    current_emeralds, _err = await asyncio.to_thread(read_current_emeralds, pm, base)
 
                     if current_emeralds is not None:
                         ctx.game_state["emeralds"] = current_emeralds

@@ -111,7 +111,7 @@ class EmeraldGoal(Choice):
     can be ignore if choose none
     """
     display_name = "Emerald Goal"
-    default = 20000
+    default = 10000
 
     # option_<amount> = <amount> for every 500-multiple from 500 to
     # 50000, plus option_disabled = 0. Built with a loop rather than
@@ -120,7 +120,7 @@ class EmeraldGoal(Choice):
     # milestone logic elsewhere (Locations.py/Regions.py/__init__.py) to
     # quietly drift apart from each other.
     option_disabled = 0
-    locals().update({f"option_{amount}": amount for amount in range(500, 50000 + 1, 500)})
+    locals().update({f"option_{amount}": amount for amount in range(500, 40000 + 1, 500)})
 
     @classmethod
     def from_any(cls, value):
@@ -131,7 +131,7 @@ class EmeraldGoal(Choice):
         # to already be a valid 500-multiple): round down to the nearest
         # valid one, same behavior the old Range.from_any had.
         rounded = (int(value) // 500) * 500
-        rounded = max(0, min(rounded, 50000))
+        rounded = max(0, min(rounded, 40000))
         return cls(rounded)
 
 
