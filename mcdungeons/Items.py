@@ -52,11 +52,22 @@ MISSION_ACCESS_ITEMS: Dict[str, ItemInfo] = {
     for z in ZONES
 }
 
-# Secret-exit access, only meaningful when secret_missions_require_secret is on.
+# Secret-mission access, only meaningful when secret_missions_require_secret is on. With that option a secret zone
+# is unlocked by its "<Zone> Secret Access" item ALONE (see zone_access_item_name); its plain "<Zone> Access" item
+# then never enters the pool. Both stay in the table either way so that no item ID ever moves.
 SECRET_ACCESS_ITEMS: Dict[str, ItemInfo] = {
     f"{z.display_name} Secret Access": ItemInfo(_alloc_id(), ItemClassification.progression)
     for z in ZONES if z.secret
 }
+
+
+def zone_access_item_name(zone, secret_option: bool) -> str:
+    """Name of the ONE item that unlocks `zone`, and that counts as the zone's Access for the zones after it.
+    A secret zone with Secret Mission Access on needs only "<Zone> Secret Access"; every other zone (and every
+    zone with the option off) uses "<Zone> Access"."""
+    if secret_option and zone.secret:
+        return f"{zone.display_name} Secret Access"
+    return f"{zone.display_name} Access"
 
 # Single item gating all three Ancient Hunts at once.
 ANCIENT_HUNT_ACCESS_ITEM = "Ancient Hunt Access"
@@ -85,6 +96,19 @@ PROGRESSIVE_ENCHANT_SLOT_COPIES = 3  # 0/1/2/3 slots - one copy per tier above 0
 # on. Only added to the pool when the option is enabled (see __init__.py).
 PROGRESSIVE_PICKUP_ITEM = "Progressive Pickup"
 PROGRESSIVE_PICKUP_COPIES = 3  # tier 0 (start) -> 1 -> 2 -> 3 (final tier)
+
+# Eye of Ender: 6 identical progression items, only created with the eye_of_ender_checks option. They are
+# the logic keys for The Stronghold (Rules.py: it needs all of them); the real Eyes the mini bosses drop are
+# turned into checks instead (Locations.py EYE_OF_ENDER_TABLE). Added at the very END of ITEM_TABLE so no
+# existing item ID shifts.
+EYE_OF_ENDER_ITEM = "Eye of Ender"
+EYE_OF_ENDER_COPIES = 6
+
+# Villager items (option villager_checks): one per captured camp merchant, received instead of freeing the villager
+# in the mission. Unlocks the merchant in the camp. Names must match Locations.VILLAGER_TYPES' display names (a
+# test keeps them in line). Added at the very END of ITEM_TABLE so no existing item ID shifts.
+VILLAGER_ITEM_NAMES = ["Village Merchant", "Mystery Merchant", "Luxury Merchant", "Gift Wrapper", "Blacksmith",
+                       "Enchantsmith", "Piglin Merchant"]
 
 # Tiered emerald filler rewards. The amount each one grants is looked up
 # by dungeons_reader.py (via FILLER_ITEM_EMERALD_AMOUNTS below) when the
@@ -221,6 +245,8 @@ ITEM_TABLE: Dict[str, ItemInfo] = {
     # _alloc_id() call in this file/ITEM_TABLE, so no existing ID shifts.
     "Victory - Emerald Goal": ItemInfo(_alloc_id(), ItemClassification.progression),
     "Victory - Goal Mission": ItemInfo(_alloc_id(), ItemClassification.progression),
+    EYE_OF_ENDER_ITEM: ItemInfo(_alloc_id(), ItemClassification.progression),
+    **{name: ItemInfo(_alloc_id(), ItemClassification.useful) for name in VILLAGER_ITEM_NAMES},
 }
 
 

@@ -1,0 +1,221 @@
+{
+ "_comment": "zone internal_name -> ELevelNames ids (base + daily/weekly/seasonal variants), from the Dumper-7 SDK. Zones missing here are not gated by the DLL (the kill fallback still covers them).",
+ "zones": {
+  "squidcoast": [
+   1
+  ],
+  "creeperwoods": [
+   2,
+   12,
+   13,
+   14
+  ],
+  "creepycrypt": [
+   42,
+   56,
+   57,
+   58
+  ],
+  "pumpkinpastures": [
+   3,
+   15,
+   16,
+   17
+  ],
+  "archhaven": [
+   45,
+   65,
+   66,
+   67
+  ],
+  "soggyswamp": [
+   4,
+   18,
+   19,
+   20
+  ],
+  "soggycave": [
+   43,
+   59,
+   60,
+   61
+  ],
+  "fieryforge": [
+   6,
+   24,
+   25,
+   26
+  ],
+  "cacticanyon": [
+   11,
+   39,
+   40,
+   41
+  ],
+  "deserttemple": [
+   7,
+   27,
+   28,
+   29
+  ],
+  "lowertemple": [
+   46,
+   68,
+   69,
+   70
+  ],
+  "highblockhalls": [
+   9,
+   33,
+   34,
+   35
+  ],
+  "underhalls": [
+   44,
+   62,
+   63,
+   64
+  ],
+  "obsidianpinnacle": [
+   10,
+   36,
+   37,
+   38
+  ],
+  "mooshroomisland": [
+   47,
+   71,
+   72,
+   73
+  ],
+  "thestronghold": [
+   147
+  ],
+  "enderwilds": [
+   145,
+   148,
+   149,
+   150
+  ],
+  "endcitadel_blightedcitadel": [
+   146,
+   151,
+   152,
+   153
+  ],
+  "dingyjungle": [
+   50,
+   74,
+   75,
+   76
+  ],
+  "overgrowntemple": [
+   51,
+   77,
+   78,
+   79
+  ],
+  "bamboobluff": [
+   52,
+   80,
+   81,
+   82
+  ],
+  "frozenfjord": [
+   53,
+   83,
+   84,
+   85
+  ],
+  "lonefortress": [
+   54,
+   86,
+   87,
+   88
+  ],
+  "lostsettlement": [
+   55,
+   89,
+   90,
+   91
+  ],
+  "windsweptpeaks": [
+   117,
+   121,
+   122,
+   123
+  ],
+  "gauntletofgales": [
+   120,
+   130,
+   131,
+   132
+  ],
+  "galesanctum": [
+   118,
+   124,
+   125,
+   126
+  ],
+  "endlessrampart": [
+   119,
+   127,
+   128,
+   129
+  ],
+  "coralrise": [
+   133,
+   136,
+   137,
+   138
+  ],
+  "abyssalmonument": [
+   134,
+   139,
+   140,
+   141
+  ],
+  "radiantravine": [
+   135,
+   142,
+   143,
+   144
+  ],
+  "netherwastes": [
+   96,
+   111,
+   112,
+   113
+  ],
+  "warpedforest": [
+   94,
+   105,
+   106,
+   107
+  ],
+  "crimsonforest": [
+   92,
+   99,
+   100,
+   101
+  ],
+  "soulsandvalley": [
+   95,
+   108,
+   109,
+   110
+  ],
+  "basaltdeltas": [
+   93,
+   102,
+   103,
+   104
+  ],
+  "netherfortress": [
+   97,
+   114,
+   115,
+   116
+  ]
+ }
+}

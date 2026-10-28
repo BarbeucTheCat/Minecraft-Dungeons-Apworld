@@ -10,7 +10,7 @@ Each ZoneInfo entry:
     requires:       which mission(s) you need first. More than one
                        means you need ALL of them. Empty means no
                        predecessor.
-    secret:         Make secret mission differant than a normal mission
+    secret:         Make a secret mission different from a normal mission
                        allow to make there access item in the option
     min_difficulty: "I" through "V" Not used, doesn't
                        affect logic here
@@ -58,7 +58,7 @@ ZONES: List[ZoneInfo] = [
         False, "IV",
     ),
 
-    #Echoing Void (Stonghold is a Mainland Mission)
+    #Echoing Void (Stronghold is a Mainland Mission)
     ZoneInfo("thestronghold", "The Stronghold", "base", ["obsidianpinnacle"], False, "III"),
     ZoneInfo("enderwilds", "End Wilds", "dlc", ["thestronghold"], False, "II", dlc_pack="echoing_void_dlc"),
     ZoneInfo("endcitadel_blightedcitadel", "Broken Citadel", "dlc", ["enderwilds"], False, "IV", dlc_pack="echoing_void_dlc"),
@@ -107,7 +107,7 @@ ZONES_BY_NAME = {z.internal_name: z for z in ZONES}
 
 
 def skip_level_requires_map(enabled_names=None):
-    """The logic for mission unlock (look at the parents mission and it's grands parrent)"""
+    """The logic for mission unlock (look at the parent mission and its grandparent)"""
     names = enabled_names if enabled_names is not None else set(ZONES_BY_NAME)
     result = {}
     for name, zone in ZONES_BY_NAME.items():

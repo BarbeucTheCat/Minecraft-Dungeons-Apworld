@@ -2,7 +2,7 @@ import re
 from dataclasses import dataclass
 from typing import Dict
 
-from Options import Toggle, Range, Choice, DeathLink, PerGameCommonOptions
+from Options import Toggle, Range, Choice, DeathLink, OptionSet, PerGameCommonOptions
 
 from .ZoneData import ZONES
 
@@ -52,17 +52,39 @@ class EchoingVoidDLC(Toggle):
 
 
 class DlcMissionsOptional(Toggle):
-    """Make DLC mission optionnal so if you're goal is in the mainland you don't have to do DLC mission to completed it"""
+    """Make DLC missions optional: if your goal is in the mainland, you don't have to complete any DLC mission to finish the game."""
     display_name = "DLC Missions Optional"
     default = Toggle.option_true
 
 
+# DLC pack label (what the player writes in the YAML) -> the name of that pack's Toggle option.
+DLC_PACK_BY_LABEL: Dict[str, str] = {
+    "Jungle Awakens": "jungle_awakens_dlc",
+    "Creeping Winter": "creeping_winter_dlc",
+    "Howling Peaks": "howling_peaks_dlc",
+    "Hidden Depths": "hidden_depths_dlc",
+    "Flames of the Nether": "flames_of_the_nether_dlc",
+    "Echoing Void": "echoing_void_dlc",
+}
+
+
+class RequiredDlcs(OptionSet):
+    """Choose which DLC packs may hold important progression items. A selected DLC and its missions can contain
+    items you need to progress, so you must play it. If a DLC is not selected, its checks only ever contain
+    non-progression items (it stays playable, just never required).
+    Leave empty to let "DLC Missions Optional" decide for all packs at once. A listed pack must also be enabled
+    with its own DLC option. If your Goal Mission is in a DLC, that pack is always selected."""
+    display_name = "Required DLC Packs"
+    valid_keys = frozenset(DLC_PACK_BY_LABEL)
+
+
 class SecretMissionsAccess(Toggle):
-    """If enabled, you need to unlock the secret mission before accessing it (Creepy Crypt, Arch Haven,
+    """If enabled, a secret mission is unlocked by its own single "Secret Access" item (it has no separate "Access"
+    item) before you can access it (Creepy Crypt, Arch Haven,
     Soggy Cave, Lower Temple, Underhalls, Panda Plateau, Lost Settlement,
     Colossal Rampart, Radiant Ravine, Crimson Forest, Soul Sand Valley,
     Nether Fortress)"""
-    display_name = "Secret Mission Acess"
+    display_name = "Secret Mission Access"
 
 
 class AncientHuntsEnabled(Toggle):
@@ -72,32 +94,83 @@ class AncientHuntsEnabled(Toggle):
 
 
 class AncientHuntBossChecks(Toggle):
-    """If enabled, make boss in Ancient Hunts Check (Woodland Mansion, Woodland Prison, Spider Cave)."""
+    """If enabled, the bosses of the Ancient Hunts give checks (Woodland Mansion, Woodland Prison, Spider Cave)."""
     display_name = "Ancient Hunt Boss Checks"
 
 
 class BossKillChecks(Toggle):
-    """If enabled, Make Boss Check if they are not in a DLC and Ancient Hunts."""
+    """If enabled, bosses give checks (except DLC bosses and Ancient Hunt bosses)."""
     display_name = "Boss Kill Checks"
 
 
 class DlcBossKillChecks(Toggle):
-    """If enabled, Make DLC boss check"""
+    """If enabled, DLC bosses give checks."""
     display_name = "DLC Boss Kill Checks"
 
 
+class MiniBossKillChecks(Choice):
+    """Checks for beating mini bosses (powerful mobs) in base-game missions.
+    none: no mini boss checks.
+    per_type: one check per kind of mini boss, the first time you beat one anywhere. A kind cannot be forced to
+    appear, so these checks never hold progression items.
+    per_zone: one check per mission that has a mini boss. A mini boss is forced to appear in every such mission
+    (summoned when you open the mission's last chest check if none was beaten there yet).
+    both: per_type and per_zone."""
+    display_name = "Mini Boss Kill Checks"
+    option_none = 0
+    option_per_type = 1
+    option_per_zone = 2
+    option_both = 3
+    alias_false = 0
+    alias_off = 0
+    alias_true = 2
+    default = 0
+
+
+class DlcMiniBossKillChecks(Choice):
+    """Checks for beating mini bosses (powerful mobs) in DLC missions (only the packs that are enabled).
+    none: no mini boss checks.
+    per_type: one check per kind of mini boss, the first time you beat one anywhere. A kind cannot be forced to
+    appear, so these checks never hold progression items.
+    per_zone: one check per mission that has a mini boss. A mini boss is forced to appear in every such mission
+    (summoned when you open the mission's last chest check if none was beaten there yet).
+    both: per_type and per_zone."""
+    display_name = "DLC Mini Boss Kill Checks"
+    option_none = 0
+    option_per_type = 1
+    option_per_zone = 2
+    option_both = 3
+    alias_false = 0
+    alias_off = 0
+    alias_true = 2
+    default = 0
+
+
+class EyeOfEnderChecks(Toggle):
+    """Makes the Eyes of Ender randomized in the multiworld. They become 6 checks (one per zone of appearance)
+    that you need to collect, and also 6 items that you need to collect before you can go to the Stronghold."""
+    display_name = "Eye of Ender Checks"
+
+
+class VillagerChecks(Toggle):
+    """Makes the captured villagers randomized in the multiworld. Freeing a captured camp merchant (Village Merchant,
+    Mystery Merchant, Luxury Merchant, Gift Wrapper, Blacksmith) sends a check instead of unlocking that merchant in
+    your camp, and the merchant is an item you receive from the multiworld."""
+    display_name = "Villager Checks"
+
+
 class ProgressivePickups(Toggle):
-    """Make pick up item progressive (tier 0 can pick up arrow and tools (weapon, armor,...))
-    (tier 1 can pick up health item (bread, apple, ...))
-    (tier 2 can pick up potion)
-    (tier 3 and final tier can pick up TNT)
-    WARNING this option was not tested in dlc mission you may be able to pickup item not intended to be"""
+    """Make item pickups progressive (tier 0 can pick up arrows and tools (weapons, armor, ...))
+    (tier 1 can pick up health items (bread, apples, ...))
+    (tier 2 can pick up potions)
+    (tier 3, the final tier, can pick up TNT)
+    WARNING: this option was not tested in DLC missions; you may be able to pick up items that are not intended to be available."""
     display_name = "Progressive Pickups"
 
 
 class BonusChestCount(Range):
-    """ [recommended] chest have set amount per zone you need to open
-    If you find more chest than the set amount you can get non progressive item as a bonus"""
+    """[recommended] Each zone has a set number of chests you need to open.
+    If you find more chests than that number, you can get non-progression items as a bonus."""
     display_name = "Bonus Chest Count"
     range_start = 0
     range_end = 100
@@ -106,9 +179,9 @@ class BonusChestCount(Range):
 
 class EmeraldGoal(Choice):
     """
-    Choose the amount of emerald you need to have to finish you're game if you choose goal
-    and every 500 emerald is a check if you have choose check or both
-    can be ignore if choose none
+    Choose the amount of emeralds you need to have to finish your game if you choose goal.
+    Every 500 emeralds is a check if you chose checks or both.
+    Ignored if you choose none.
     """
     display_name = "Emerald Goal"
     default = 10000
@@ -136,8 +209,8 @@ class EmeraldGoal(Choice):
 
 
 class EmeraldMode(Choice):
-    """Choose if you need emerald for you're goal, only for check or for both
-    but if you don't whant to collact emerald choose "none" """
+    """Choose whether emeralds are needed for your goal, only for checks, or for both.
+    If you don't want to collect emeralds, choose "none"."""
     display_name = "Emerald Mode"
     option_none = 0
     option_checks = 1
@@ -154,6 +227,20 @@ class EmeraldMode(Choice):
         return self.value in (self.option_goal, self.option_both)
 
 
+class GameStore(Choice):
+    """Where the game came from"""
+    display_name = "Game Store"
+    option_steam = 0
+    option_minecraft_launcher = 1
+    option_microsoft_store = 2
+    default = option_steam
+
+    @property
+    def store_key(self) -> str:
+        """Matches dungeons_reader.STORE_OFFSETS keys."""
+        return {0: "steam", 1: "minecraft_launcher", 2: "microsoft_store"}[self.value]
+
+
 # value -> zone internal_name, in the same order the option_<slug>
 # attributes below get generated. generate_early's DLC validation and
 # Regions.py's completion-condition wiring both need this reverse lookup.
@@ -168,8 +255,8 @@ GOAL_MISSION_ID_TO_ZONE: Dict[int, str] = {i: z.internal_name for i, z in enumer
 _goal_mission_namespace = {
     "display_name": "Goal Mission",
     "__doc__": (
-        "Choose a mission you have to beat to finish you're game "
-        "Can be combine with emerald goal and can be ignore by choosing none"
+        "Choose a mission you have to beat to finish your game. "
+        "It can be combined with the emerald goal, and is ignored if you choose none."
     ),
     "option_none": 0,
     "default": 0,
@@ -180,6 +267,7 @@ GoalMission = type("GoalMission", (Choice,), _goal_mission_namespace)
 
 @dataclass
 class MCDungeonsOptions(PerGameCommonOptions):
+    game_store: GameStore
     jungle_awakens_dlc: JungleAwakensDLC
     creeping_winter_dlc: CreepingWinterDLC
     howling_peaks_dlc: HowlingPeaksDLC
@@ -187,6 +275,7 @@ class MCDungeonsOptions(PerGameCommonOptions):
     flames_of_the_nether_dlc: FlamesOfTheNetherDLC
     echoing_void_dlc: EchoingVoidDLC
     dlc_missions_optional: DlcMissionsOptional
+    required_dlcs: RequiredDlcs
     secret_missions_require_secret: SecretMissionsAccess
     ancient_hunts: AncientHuntsEnabled
     ancient_hunt_boss_checks: AncientHuntBossChecks
@@ -195,6 +284,10 @@ class MCDungeonsOptions(PerGameCommonOptions):
     goal_mission: GoalMission
     boss_kill_checks: BossKillChecks
     dlc_boss_kill_checks: DlcBossKillChecks
+    mini_boss_kill_checks: MiniBossKillChecks
+    eye_of_ender_checks: EyeOfEnderChecks
+    villager_checks: VillagerChecks
+    dlc_mini_boss_kill_checks: DlcMiniBossKillChecks
     progressive_pickups: ProgressivePickups
     bonus_chest_count: BonusChestCount
     death_link: DeathLink

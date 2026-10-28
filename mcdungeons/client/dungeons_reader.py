@@ -85,7 +85,9 @@ except ImportError as _e:
     pymem = None
     PYMEM_IMPORT_ERROR = _e
 import json
+from crash_diag import journaled   # mutation journal / circuit breaker (see crash_diag.py)
 import os
+import random
 import struct
 import sys
 import tempfile
@@ -290,6 +292,43 @@ def save_game_store(store):
     GAME_STORE = store
     OFFSETS.update(STORE_OFFSETS[store])
     PROCESS_NAME = STORE_PROCESS_NAMES[store]
+
+
+SEED_GAME_STORE_FILENAME = "game_store.json"   # in the folder of EACH seed
+
+
+def load_seed_game_store(seed_dir):
+    """Store chosen with /set_store for THIS seed (seed_dir/game_store.json),
+    or None if never chosen. Takes priority over the YAML's game_store option."""
+    try:
+        with open(os.path.join(str(seed_dir), SEED_GAME_STORE_FILENAME)) as f:
+            store = json.load(f).get("store")
+        return store if store in STORE_OFFSETS else None
+    except Exception:
+        return None
+
+
+def save_seed_game_store(seed_dir, store):
+    if store not in STORE_OFFSETS:
+        raise ValueError(f"Unknown store {store!r} - must be one of {list(STORE_OFFSETS)}")
+    os.makedirs(str(seed_dir), exist_ok=True)
+    with open(os.path.join(str(seed_dir), SEED_GAME_STORE_FILENAME), "w") as f:
+        json.dump({"store": store}, f)
+
+
+def apply_game_store(store):
+    """Apply a store to the CURRENT session only (offsets + process name),
+    without touching game_store.json: the YAML choice must not overwrite the
+    player's local /set_store setting. Returns True if it changed."""
+    global GAME_STORE, PROCESS_NAME
+    if store not in STORE_OFFSETS:
+        raise ValueError(f"Unknown store {store!r} - must be one of {list(STORE_OFFSETS)}")
+    if store == GAME_STORE:
+        return False
+    GAME_STORE = store
+    OFFSETS.update(STORE_OFFSETS[store])
+    PROCESS_NAME = STORE_PROCESS_NAMES[store]
+    return True
 
 
 GAME_STORE = load_game_store()
@@ -572,6 +611,24 @@ def resolve_gamebp_class_index(pm, snapshot, debug_log=None):
 # UWalletComponent::mCurrencySlots (TArray<UItemSlot*>), then
 # UItemSlot::Count (int32) - this is the actual emerald/gold balance path.
 OFFSETS["wallet_component"] = 0xE78   # APlayerCharacter -> UWalletComponent*
+#
+# Confirmed identical on two independent Dumper-7 dumps: Steam's current
+# build AND Microsoft Store's build - byte-for-byte same header output,
+# both offsets unchanged. minecraft_launcher was NOT separately dumped
+# (microsoft_store and minecraft_launcher share the "Dungeons.exe" process
+# name in STORE_PROCESS_NAMES, but that's just the exe name matching, not
+# proof they're the same build/installer - they could still diverge).
+# If emerald grants or /secret ever misbehave specifically under
+# minecraft_launcher, re-check this offset there first before assuming
+# it's some other bug - everything above was only ever validated for
+# steam and microsoft_store.
+OFFSETS["mission_progress_component"] = 0xED8   # APlayerCharacter -> UMissionProgressComponent*
+                                                  # (declared right after WalletComponent on
+                                                  # APlayerCharacter, 0x0E78+0x60. Previously never
+                                                  # actually filled in here - see
+                                                  # find_mission_progress_component's own docstring -
+                                                  # which is why call_is_mission_completed silently
+                                                  # returned None for every zone, every time.)
 OFFSETS["currency_slots"] = 0x130     # UWalletComponent -> TArray<UItemSlot*> mCurrencySlots
 OFFSETS["slot_count"] = 0x1FC         # UItemSlot -> int32 Count
 
@@ -948,26 +1005,18 @@ OFFSETS["level_actors"] = 0x98  # ULevel::Actors, from Dumper-7: Off::InSDK::ULe
 # (player start, lighting, etc.) - the real zone content lives in these
 # sub-levels instead.
 #
-# STILL TBD - get these two from your Dumper-7 SDK dump:
-#   - UWorld::StreamingLevels offset      (search "class UWorld" in
-#     Engine_classes.hpp - it's a TArray<ULevelStreaming*>)
-#   - ULevelStreaming's loaded-level ptr   (search "class ULevelStreaming"
-#     - look for a ULevel* member, commonly named LoadedLevel)
-# Until both are filled in, scan_full_zone() falls back to persistent-level
-# actors only (same as scan_world_actors) - nothing breaks, it just won't
-# see the full zone yet.
+# Both offsets come from the Dumper-7 dump of the game (Engine_classes.hpp):
+#   UWorld::StreamingLevels       = 0x88   (TArray<ULevelStreaming*>)
+#   ULevelStreaming::LoadedLevel  = 0x128  (ULevel*)
+# DungeonsLevelStreamingDynamic only adds fields after the base class, so 0x128 holds for it too.
 
-OFFSETS["streaming_levels"] = None  # TArray<ULevelStreaming*> on UWorld - TBD
-OFFSETS["loaded_level"] = None      # ULevel* on ULevelStreaming - TBD
+OFFSETS["streaming_levels"] = 0x88   # TArray<ULevelStreaming*> on UWorld
+OFFSETS["loaded_level"] = 0x128      # ULevel* on ULevelStreaming
 
 
 def get_streaming_sublevels(pm, world):
     """Returns a list of ULevel addresses for every currently-loaded
-    streaming sub-level. Empty list until the two TBD offsets above are
-    filled in."""
-    if OFFSETS["streaming_levels"] is None or OFFSETS["loaded_level"] is None:
-        return []
-
+    streaming sub-level."""
     tarray_header = world + OFFSETS["streaming_levels"]
     try:
         data_ptr = pm.read_longlong(tarray_header)
@@ -1230,9 +1279,8 @@ def scan_full_zone(pm, world, max_actors=4000):
     """Persistent level + every loaded streaming sub-level, merged into
     one snapshot. This is what actually captures a whole zone's chests
     and enemies - use it instead of scan_world_actors() for anything
-    zone-wide (chest/enemy surveys especially). Falls back to persistent-
-    level-only if the streaming offsets aren't filled in yet, so nothing
-    breaks in the meantime."""
+    zone-wide (chest/enemy surveys especially). The streaming offsets are
+    fixed (0x88 / 0x128, see above); a level that cannot be read is skipped."""
     level = get_persistent_level(pm, world)
     if not level:
         return {}
@@ -1242,6 +1290,26 @@ def scan_full_zone(pm, world, max_actors=4000):
         combined.update(scan_level_actors(pm, sublevel, max_actors))
     return combined
 
+
+
+# One walk of the level shared by every periodic watcher (powerful-mob tracker, Eye of Ender scan, /chests):
+# walking all the actors of the persistent level + its streaming sub-levels is the expensive part, so the
+# result is kept for a moment and reused by whoever asks within max_age seconds, for the same level.
+_zone_snapshot_cache = {"key": None, "time": 0.0, "data": {}}
+
+
+def scan_full_zone_shared(pm, world, max_age=1.0):
+    """scan_full_zone() with a short-lived cache (see above). The returned dict is shared: read-only!"""
+    level = get_persistent_level(pm, world)
+    if not level:
+        return {}
+    key = (world, level)
+    cache = _zone_snapshot_cache
+    if cache["key"] == key and time.time() - cache["time"] <= max_age:
+        return cache["data"]
+    data = scan_full_zone(pm, world)
+    cache["key"], cache["time"], cache["data"] = key, time.time(), data
+    return data
 
 
 # Found via scan_stash_diff() after a real shop purchase - UNTESTED as an
@@ -2619,6 +2687,7 @@ def _connect_bridge_pipe(pm, retries=10, delay=0.05, busy_budget=5.0):
     raise last_error
 
 
+@journaled
 def set_pickup_tier(pm, tier):
     """Tells dungeons_bridge.dll's hkProcessEvent hook which progressive-
     pickup tier is currently unlocked (0-3, see PICKUP_TIER_NAMES) -
@@ -3353,6 +3422,138 @@ def bridge_hook_silence(pm, ms):
     return (not response.startswith("ERROR")), response
 
 
+_LEVEL_GATE_IDS_CACHE = None
+
+
+def _level_gate_ids():
+    """zone internal_name -> [ELevelNames ids] from level_gate_ids.json (generated from the Dumper-7 SDK)."""
+    global _LEVEL_GATE_IDS_CACHE
+    if _LEVEL_GATE_IDS_CACHE is None:
+        import json
+        from pathlib import Path
+        try:
+            data = json.loads((Path(__file__).parent / "level_gate_ids.json").read_text(encoding="utf-8"))
+            _LEVEL_GATE_IDS_CACHE = {z: [int(i) for i in ids] for z, ids in data.get("zones", {}).items()}
+        except Exception:
+            _LEVEL_GATE_IDS_CACHE = {}
+    return _LEVEL_GATE_IDS_CACHE
+
+
+def level_gate_locked_ids(unlocked_zones):
+    """ELevelNames ids (base + daily/weekly/seasonal) of every zone that is NOT truly unlocked yet. The starting
+    zone is never included. Zones without an entry in level_gate_ids.json are not gated (kill fallback covers them)."""
+    ids = set()
+    for zone, zone_ids in _level_gate_ids().items():
+        if zone == "squidcoast" or zone not in MISSION_ACCESS_ITEM_IDS:
+            continue
+        if not is_zone_truly_unlocked(zone, unlocked_zones):
+            ids.update(zone_ids)
+    return sorted(ids)
+
+
+@journaled
+def set_level_gate(pm, mode, ids):
+    """Tells the DLL which missions to refuse at the camp: mode 0 = trace only, 1 = deny `ids` (ELevelNames).
+    Needs the dungeons_bridge.dll rebuilt from the matching .cpp (older DLLs answer with an error).
+    Returns (ok, error_text)."""
+    try:
+        import win32file
+    except ImportError:
+        return False, "pywin32 not installed - pip install pywin32"
+    try:
+        pipe = _connect_bridge_pipe(pm)
+    except Exception as e:
+        return False, f"couldn't connect to dungeons_bridge.dll: {e}"
+    try:
+        win32file.WriteFile(pipe, f"set_level_gate {int(mode)} {','.join(str(int(i)) for i in ids)}".encode())
+        _, data = win32file.ReadFile(pipe, 4096)
+    except Exception as e:
+        return False, f"pipe error: {e}"
+    finally:
+        try:
+            win32file.CloseHandle(pipe)
+        except Exception:
+            pass
+    text = data.decode("utf-8", errors="replace")
+    return (text == "OK"), (None if text == "OK" else f"unexpected response (DLL not rebuilt?): {text}")
+
+
+def bridge_crash_guard_stats(pm):
+    """{'enabled': bool, 'sites': int, 'hits': int} from the DLL's crash guard, or None (old DLL / pipe down)."""
+    try:
+        import win32file
+        pipe = _connect_bridge_pipe(pm)
+    except Exception:
+        return None
+    try:
+        win32file.WriteFile(pipe, b"get_crash_guard")
+        _, data = win32file.ReadFile(pipe, 4096)
+        text = data.decode("utf-8", errors="replace")
+        if not text.startswith("GUARD:"):
+            return None
+        fields = dict(part.split("=", 1) for part in text[len("GUARD:"):].split(",") if "=" in part)
+        return {"enabled": fields.get("enabled") == "1", "sites": int(fields.get("sites", 0)), "hits": int(fields.get("hits", 0))}
+    except Exception:
+        return None
+    finally:
+        try:
+            win32file.CloseHandle(pipe)
+        except Exception:
+            pass
+
+
+@journaled
+def bridge_set_crash_guard(pm, mode):
+    """Live switch of the DLL's crash guard ("on" / "off"). Returns (ok, response_text)."""
+    try:
+        import win32file
+    except ImportError:
+        return False, "pywin32 missing"
+    try:
+        pipe = _connect_bridge_pipe(pm)
+    except Exception as e:
+        return False, f"DLL pipe not reachable: {e}"
+    try:
+        win32file.WriteFile(pipe, f"set_crash_guard {mode}".encode())
+        _, data = win32file.ReadFile(pipe, 4096)
+    except Exception as e:
+        return False, f"pipe error: {e}"
+    finally:
+        try:
+            win32file.CloseHandle(pipe)
+        except Exception:
+            pass
+    text = data.decode("utf-8", errors="replace")
+    return (text == "OK"), text
+
+
+def bridge_dump_recorder(pm):
+    """Asks the DLL to freeze and log its flight recorder (the last ProcessEvent calls) right now. Used when a
+    player types "bug" in the Archipelago chat during a black screen. The result is written by the DLL to
+    dungeons_bridge_debug.log ("FLIGHT RECORDER: ..." lines). Returns (ok, response_text)."""
+    try:
+        import win32file
+    except ImportError:
+        return False, "pywin32 missing"
+    try:
+        pipe = _connect_bridge_pipe(pm)
+    except Exception as e:
+        return False, f"DLL pipe not reachable: {e}"
+    try:
+        win32file.WriteFile(pipe, b"dump_recorder")
+        _, data = win32file.ReadFile(pipe, 4096)
+    except Exception as e:
+        return False, f"pipe error: {e}"
+    finally:
+        try:
+            win32file.CloseHandle(pipe)
+        except Exception:
+            pass
+    response = data.decode("utf-8", errors="replace")
+    return (not response.startswith("ERROR")), response
+
+
+@journaled
 def call_ufunction_no_params(pm, object_addr, function_addr):
     """Calls a zero-parameter UFunction via ProcessEvent, replicating
     EXACTLY the idiom Dumper-7's own generated wrappers use for native
@@ -3495,6 +3696,7 @@ def find_confirmed_kill_function(pm, pawn):
     return matches[0] if matches else None
 
 
+@journaled
 def kill_local_player(pm, base):
     """Kills the local player for real. Prefers calling the confirmed
     ABaseCharacter::Kill() UFunction (see find_kill_function /
@@ -3606,6 +3808,7 @@ RARITY_BYTES = {v: k for k, v in RARITY_NAMES.items()}
 REVERSE_NAME_LOOKUP = {v: k for k, v in NAME_LOOKUP.items()}
 
 
+@journaled
 def write_item(pm, item_struct_address, name_index, rarity_byte, power):
     """Low-level write: overwrites one item's id/rarity/power in place.
     Same offsets used everywhere else in this file for reading, just in
@@ -3734,6 +3937,7 @@ def parse_give_args(args):
     return " ".join(name_parts), rarity, power, strategy, refresh_mode
 
 
+@journaled
 def give_reward(pm, item_stash_address, item_name, rarity="Common", power=1.0, slot_index=None,
                  strategy="latest", refresh_mode="none"):
     """Grants an item as an Archipelago check reward by overwriting an
@@ -4243,6 +4447,82 @@ def get_death_events(pm):
         return []
     return [int(addr_hex, 16) for addr_hex in rest.split("|") if addr_hex]
 
+def get_secret_events(pm):
+    """Drains dungeons_bridge.dll's SecretFound queue - one entry per
+    USecretComponent::SecretFound / ExecuteSecretFound call seen since the
+    last drain (the same secret can show up twice, once per function name,
+    so callers must dedupe per zone). Returns a list of (actor_addr,
+    class_name), or None on connection failure."""
+    try:
+        import win32file
+    except ImportError:
+        return None
+    try:
+        pipe = _connect_bridge_pipe(pm)
+    except Exception:
+        return None
+    try:
+        win32file.WriteFile(pipe, b"get_secret_events")
+        _, data = win32file.ReadFile(pipe, 65536)
+    finally:
+        win32file.CloseHandle(pipe)
+
+    response = data.decode()
+    if not response.startswith("EVENTS:"):
+        return None
+    body = response[len("EVENTS:"):]
+    count_str, _, rest = body.partition("|")
+    if count_str == "0" or not rest:
+        return []
+    events = []
+    for entry in rest.split("|"):
+        parts = entry.split(",")
+        if parts and parts[0]:
+            try:
+                # (actor_addr, class_name, func_name) - func_name is "SecretFound"
+                # (any secret in a level, hidden chests too) or
+                # "ShowSecretMissionUnlocked" (a secret MISSION got unlocked);
+                # older DLLs send no func_name, which is read as "SecretFound".
+                events.append((int(parts[0], 16),
+                               parts[1] if len(parts) > 1 else "",
+                               parts[2] if len(parts) > 2 else "SecretFound"))
+            except ValueError:
+                continue
+    return events
+
+
+# time.time() of this client's own last ClientUnlockBonusMission call - the game
+# answers it with a ShowSecretMissionUnlocked event of its own, which must not be
+# mistaken for the player finding a secret.
+LAST_OWN_UNLOCK_NOTIFY = 0.0
+
+
+@journaled
+def set_secret_block(pm, level):
+    """Sets the DLL's SecretFound blocking level (bool also accepted):
+    0 = off, 1 = swallow SecretFound / ExecuteSecretFound, 2 = also swallow
+    the BP handler OnSecretFoundRecieved. The event is always queued for
+    get_secret_events first. Needs the dungeons_bridge.dll rebuilt from the
+    matching dungeons_bridge.cpp (older DLLs answer with an error)."""
+    level = int(level)
+    try:
+        import win32file
+    except ImportError:
+        return False, "pywin32 not installed - pip install pywin32"
+    try:
+        pipe = _connect_bridge_pipe(pm)
+    except Exception as e:
+        return False, f"couldn't connect to dungeons_bridge.dll: {e}"
+    try:
+        win32file.WriteFile(pipe, f"set_secret_block {level}".encode())
+        _, data = win32file.ReadFile(pipe, 65536)
+    finally:
+        win32file.CloseHandle(pipe)
+    if data.decode() != "OK":
+        return False, f"unexpected response (DLL not rebuilt?): {data.decode()}"
+    return True, None
+
+
 def get_wallet_component(pm, base):
     """Resolves the live UWalletComponent* for the local player, via
     Pawn -> +OFFSETS['wallet_component'] (0xE78, confirmed straight from
@@ -4552,7 +4832,13 @@ def find_wallet_add_function(pm, wallet_class):
 
 
 def apply_emerald_reward(pm, base, amount):
-    """Adds `amount` to the player's current emerald total by calling
+    """Adds `amount` emeralds - see apply_currency_reward (this is just the Emerald currency)."""
+    return apply_currency_reward(pm, base, EMERALD_CURRENCY_ITEM_ID, amount)
+
+
+@journaled
+def apply_currency_reward(pm, base, currency_item_id, amount):
+    """Adds `amount` to the player's current total of one currency (emeralds, eyes of ender...) by calling
     the REAL UWalletComponent::ClientAdd(Type, Amount, reason) UFUNCTION
     via ProcessEvent (same remote-call technique already used for
     call_is_mission_completed) - NOT a raw memory write.
@@ -4621,7 +4907,7 @@ def apply_emerald_reward(pm, base, amount):
         return False, f"couldn't locate ClientAdd: {err}"
 
     params_bytes = (
-        _pack_serializable_item_id(EMERALD_CURRENCY_ITEM_ID)
+        _pack_serializable_item_id(currency_item_id)
         + struct.pack("<i", amount)
         + bytes([2])          # ECurrencyObtainReason::Pickup = 2 - mimics a normal
                                # in-game pickup, confirmed from the real enum values
@@ -5085,6 +5371,15 @@ ELEVELNAMES = {
     "creepycrypt": 42, "soggycave": 43, "underhalls": 44, "archhaven": 45,
     "lowertemple": 46, "mooshroomisland": 47, "woodlandmansion": 48,
     "spidercave": 49,
+    # DLC zones - values straight from ELevelNames in Dungeons_structs.hpp (Dumper-7 SDK dump)
+    "dingyjungle": 50, "overgrowntemple": 51, "bamboobluff": 52, "frozenfjord": 53,
+    "lonelyfortress": 54, "lostsettlement": 55,
+    "crimsonforest": 92, "basaltdeltas": 93, "warpedforest": 94, "soulsandvalley": 95,
+    "netherwastes": 96, "netherfortress": 97,
+    "windsweptpeaks": 117, "galesanctum": 118, "endlessrampart": 119, "gauntletgales": 120,
+    "coralrise": 133, "abyssalmonument": 134, "radiantravine": 135,
+    "enderwilds": 145, "blightedcitadel": 146, "thestronghold": 147,
+    "freejungle": 155,
 }
 
 # Map from THIS script's own zone-name spelling (used throughout
@@ -5094,6 +5389,13 @@ ZONE_NAME_TO_ELEVELNAME_KEY = {
     "redstonemines": "mooncorecaverns",
     "hm_woodlandmansion": "woodlandmansion",
     "hm_spidercave": "spidercave",
+    # DLC zones whose ZoneData.py spelling differs from the game's enum name
+    "lonefortress": "lonelyfortress",
+    "gauntletofgales": "gauntletgales",
+    "endcitadel_blightedcitadel": "blightedcitadel",
+    # Confirmed in game: zone_name_lookup.json has 155 = treetoptangle, and the enum's value 155 is
+    # "freejungle" (the enum has no "treetoptangle").
+    "treetoptangle": "freejungle",
 }
 
 # zone_id_order.json (loaded way above, before this remap table even
@@ -5123,6 +5425,252 @@ def get_elevelname_value(zone_name):
     produced) to its ELevelNames enum value, or None if not mapped."""
     key = ZONE_NAME_TO_ELEVELNAME_KEY.get(zone_name, zone_name)
     return ELEVELNAMES.get(key)
+
+# ------------------------------------------------------------------
+# TEST ONLY - secret-zone unlock via UMissionProgressComponent::
+# UnlockBonusMission(ELevelNames). Confirmed to exist (Final, Native,
+# Public, BlueprintCallable - NOT Const, unlike IsMissionCompleted) via
+# a real Dumper-7 dump of Dungeons_functions.cpp. Same call technique as
+# apply_emerald_reward/call_is_mission_completed (ProcessEvent, real
+# UFUNCTION, not a memory write), on the same MissionProgressComponent
+# already used for mission-completion reads.
+#
+# NOT wired into the AP item/location flow yet - this exists purely to
+# find and confirm the right candidate index, the same two-step process
+# IS_MISSION_COMPLETED_INDEX went through (test_is_mission_completed +
+# confirm_is_mission_completed) before it became load-bearing. Once an
+# index is confirmed here, a real apply_secret_zone_unlock (mirroring
+# apply_emerald_reward) is the next step for the actual "secret access"
+# item.
+#
+# Ambiguity note: UnlockBonusMission takes a single ELevelNames (1-byte
+# enum) param and returns nothing - and MissionProgressComponent has
+# ANOTHER function, OnDifficultySelected(EGameDifficulty), with the
+# exact same shape (1-byte enum param, void, Final|Native|Public,
+# non-const) - confirmed straight from Dungeons_functions.cpp's own
+# flag comments, identical for both. Struct-size + flag matching alone
+# can't tell them apart, so this can't auto-pick one candidate the way
+# find_wallet_balance_function does (which relies on Const being unique
+# to Balance) - it batch-calls EVERY matching candidate against a real
+# secret zone and leaves it to the person running this to look at the
+# game (does a new zone actually reveal itself on the map?) and report
+# back which index did it, exactly like test_is_mission_completed's own
+# "re-run against a known-completed vs known-incomplete zone" workflow.
+# ------------------------------------------------------------------
+
+UNLOCK_SECRET_ZONE_INDEX_FILE = "unlock_secret_zone_index.json"
+
+def _load_unlock_secret_zone_index():
+    if os.path.exists(UNLOCK_SECRET_ZONE_INDEX_FILE):
+        with open(UNLOCK_SECRET_ZONE_INDEX_FILE) as f:
+            content = f.read().strip()
+        if content:
+            try:
+                return json.loads(content).get("index")
+            except json.JSONDecodeError:
+                return None
+    return None
+
+def _save_unlock_secret_zone_index(index):
+    with open(UNLOCK_SECRET_ZONE_INDEX_FILE, "w") as f:
+        json.dump({"index": index}, f, indent=2)
+
+UNLOCK_SECRET_ZONE_INDEX = _load_unlock_secret_zone_index()
+
+
+def get_ufunction_name(pm, func_addr):
+    """Real name of a UFunction (e.g. "UnlockBonusMission"): the FName at
+    UObject+0x18 (ComparisonIndex), resolved through the DLL (AppendString).
+    Returns None if the DLL is not available or the read fails."""
+    try:
+        idx = pm.read_int(func_addr + OFFSETS["uobject_name"])
+        return resolve_fname(pm, idx)
+    except Exception:
+        return None
+
+
+def _pick_any_secret_zone_name():
+    """Any one secret-zone internal_name (ZoneData.py's own .secret flag
+    - the AP world's already-confirmed ground truth for which zones are
+    secret, no live IsSecret() probing needed) that also has a resolvable
+    ELevelNames value in this script's own ELEVELNAMES table. Not random
+    - always the same one (alphabetically first) so repeated test runs
+    are comparable. Returns None if nothing qualifies (ELEVELNAMES would
+    need extending for the remaining secret zones)."""
+    secret_names = {z.internal_name for z in _apw_zonedata.ZONES if z.secret}
+    for name in sorted(secret_names):
+        if get_elevelname_value(name) is not None:
+            return name
+    return None
+
+
+def _secret_zone_candidates():
+    """Every secret zone (ZoneData.py's .secret flag) that has a known
+    ELevelNames value, sorted for stable behaviour. Today that is
+    creepycrypt, soggycave, archhaven, lowertemple, underhalls - the DLC
+    secret zones need ELEVELNAMES entries before they can show up here."""
+    return sorted(z.internal_name for z in _apw_zonedata.ZONES
+                  if z.secret and get_elevelname_value(z.internal_name) is not None)
+
+
+def pick_random_secret_zone_name(exclude=()):
+    """A random secret zone, skipping any in `exclude` (zones already
+    unlocked this session). Once every candidate is excluded it falls back
+    to picking among all of them (re-unlocking is harmless), so the command
+    never just dead-ends. Returns None only if no candidate exists at all."""
+    pool = _secret_zone_candidates()
+    if not pool:
+        return None
+    fresh = [n for n in pool if n not in set(exclude)]
+    return random.choice(fresh or pool)
+
+
+def test_unlock_any_secret_zone(pm, base, debug_log=None, index=None, zone_name=None):
+    """TEST-ONLY. Calls every (or one, if `index` given) candidate
+    UnlockBonusMission-shaped function on the live MissionProgressComponent
+    against one real secret zone (via _pick_any_secret_zone_name). Returns
+    (zone_name, [(candidate_index, func_addr, success, error_or_None), ...]),
+    or (None, []) if nothing usable (no pawn, no component, no secret zone
+    with a known ELevelNames value).
+
+    Void function, no return value to check automatically - success here
+    only means the call itself didn't error, NOT that the right function
+    got hit. Confirm visually in-game, then call
+    _save_unlock_secret_zone_index(<index>) with whichever candidate
+    actually revealed a new zone on the map."""
+    def _log(msg):
+        if debug_log:
+            debug_log(f"test_unlock_any_secret_zone: {msg}")
+
+    if zone_name is None:
+        zone_name = _pick_any_secret_zone_name()
+    if zone_name is None:
+        _log("no secret zone with a known ELevelNames value in ELEVELNAMES")
+        return None, []
+    elevelname_value = get_elevelname_value(zone_name)
+
+    pawn, err = get_pawn(pm, base)
+    if not pawn:
+        _log(f"get_pawn failed: {err}")
+        return zone_name, []
+    try:
+        component = pm.read_longlong(pawn + OFFSETS["mission_progress_component"])
+        if not component:
+            _log("mission_progress_component read as null off the current pawn")
+            return zone_name, []
+        component_class = pm.read_longlong(component + OFFSETS["uobject_class"])
+        candidates = find_functions_on_class(pm, component_class, min_size=1, max_size=8,
+                                              require_const=False)
+        if not candidates:
+            _log("no matching candidate functions found on MissionProgressComponent's class")
+            return zone_name, []
+
+        # Real names of every candidate (full log, even if only one gets called)
+        names = {i: get_ufunction_name(pm, fa) for i, (fa, _sz) in enumerate(candidates)}
+        for i, (fa, sz) in enumerate(candidates):
+            _log(f"candidate [{i}] {hex(fa)} size={sz} name={names[i]}")
+
+        if index is not None:
+            to_call = [(index, candidates[index])]
+        else:
+            # The exact name takes absolute priority: no need to guess an index
+            by_name = [(i, candidates[i]) for i in names if names[i] == "UnlockBonusMission"]
+            if by_name:
+                _log(f"UnlockBonusMission found by NAME -> index {by_name[0][0]} (single call)")
+                to_call = by_name[:1]
+            else:
+                _log("names not resolved (DLL not injected?) - fallback: only touching "
+                     "candidates whose name is unknown, never names already identified as something else")
+                to_call = [(i, candidates[i]) for i in names if names[i] in (None, "")]
+        results = []
+        for idx, (func_addr, size) in to_call:
+            params_bytes = bytes([elevelname_value]) + bytes(max(size, 8) - 1)
+            success, call_error, _params_after = call_process_event(pm, component, func_addr, params_bytes)
+            results.append((idx, func_addr, success, call_error, names.get(idx)))
+            _log(f"[{idx}] {hex(func_addr)} name={names.get(idx)} zone={zone_name} success={success} error={call_error}")
+        return zone_name, results
+    except Exception as e:
+        _log(f"raised {type(e).__name__}: {e}")
+        return zone_name, []
+
+
+def _find_function_by_name_on_chain(pm, class_ptr, wanted_name):
+    """Find a UFunction by NAME across the whole super-class chain
+    (ClientUnlockBonusMission is declared on APlayerCharacter, not on the
+    ABP_PlayerCharacter_C blueprint that inherits it). Returns (func_addr, size) or None."""
+    for level_class in walk_super_chain(pm, class_ptr):
+        for field in walk_children(pm, level_class):
+            try:
+                if get_ufunction_name(pm, field) == wanted_name:
+                    size = pm.read_int(field + OFFSETS["ustruct_size"])
+                    return field, size
+            except Exception:
+                continue
+    return None
+
+
+@journaled
+def apply_secret_zone_unlock(pm, base, zone_name, notify=True, notify_only=False, debug_log=None):
+    """Unlock a secret zone with the game's native notification (image + sound).
+
+    1) UMissionProgressComponent::UnlockBonusMission(ELevelNames)  -> changes the state
+    2) APlayerCharacter::ClientUnlockBonusMission(ELevelNames)     -> popup + sound
+       (NetClient: called with force_native=True, like the dump's wrapper).
+
+    notify=False     : state only (old behaviour).
+    notify_only=True : skips step 1 (useful if the game only shows the popup
+                       when the zone is NOT unlocked yet).
+    Returns (state_ok, notify_ok)."""
+    def _log(msg):
+        if debug_log:
+            debug_log(f"apply_secret_zone_unlock({zone_name}): {msg}")
+
+    level = get_elevelname_value(zone_name)
+    if level is None:
+        _log("zone unknown in ELEVELNAMES")
+        return False, False
+    pawn, err = get_pawn(pm, base)
+    if not pawn:
+        _log(f"get_pawn failed: {err}")
+        return False, False
+
+    try:
+        state_ok = False
+        if not notify_only:
+            component = pm.read_longlong(pawn + OFFSETS["mission_progress_component"])
+            if not component:
+                _log("mission_progress_component null")
+                return False, False
+            comp_class = pm.read_longlong(component + OFFSETS["uobject_class"])
+            found = _find_function_by_name_on_chain(pm, comp_class, "UnlockBonusMission")
+            if not found:
+                _log("UnlockBonusMission introuvable sur MissionProgressComponent")
+                return False, False
+            fa, size = found
+            state_ok, e, _ = call_process_event(
+                pm, component, fa, bytes([level]) + bytes(max(size, 8) - 1))
+            _log(f"UnlockBonusMission ok={state_ok} err={e}")
+            if not state_ok:
+                return False, False
+        if not (notify or notify_only):
+            return state_ok, False
+
+        pawn_class = pm.read_longlong(pawn + OFFSETS["uobject_class"])
+        global LAST_OWN_UNLOCK_NOTIFY
+        LAST_OWN_UNLOCK_NOTIFY = time.time()
+        found = _find_function_by_name_on_chain(pm, pawn_class, "ClientUnlockBonusMission")
+        if not found:
+            _log("ClientUnlockBonusMission introuvable sur le pawn")
+            return state_ok, False
+        fa, size = found
+        notify_ok, e, _ = call_process_event(
+            pm, pawn, fa, bytes([level]) + bytes(max(size, 8) - 1), force_native=True)
+        _log(f"ClientUnlockBonusMission ok={notify_ok} err={e}")
+        return state_ok, notify_ok
+    except Exception as e:
+        _log(f"raised {type(e).__name__}: {e}")
+        return False, False
+
 
 IS_MISSION_COMPLETED_INDEX_FILE = "is_mission_completed_index.json"
 
@@ -5172,7 +5720,7 @@ def _save_mission_progress_baseline(zone_set):
     with open(MISSION_PROGRESS_BASELINE_FILE, "w") as f:
         json.dump(sorted(zone_set), f, indent=2)
 
-def call_is_mission_completed(pm, base, zone_name, debug_log=None):
+def call_is_mission_completed(pm, base, zone_name, debug_log=None, value_override=None):
     """Calls the confirmed UMissionProgressComponent::IsMissionCompleted
     for zone_name, for real. Returns True/False, or None if anything
     along the chain isn't available (no pawn, no component, index not
@@ -5192,7 +5740,9 @@ def call_is_mission_completed(pm, base, zone_name, debug_log=None):
     if IS_MISSION_COMPLETED_INDEX is None:
         _log("IS_MISSION_COMPLETED_INDEX not confirmed (is_mission_completed_index.json missing/empty)")
         return None
-    elevelname_value = get_elevelname_value(zone_name)
+    # value_override: raw ELevelNames byte, used by the sanity probe (an impossible value, which the
+    # real IsMissionCompleted must answer False to) instead of a real zone's value.
+    elevelname_value = value_override if value_override is not None else get_elevelname_value(zone_name)
     if elevelname_value is None:
         _log(f"get_elevelname_value returned None - {zone_name!r} not recognized as an ELevelNames value")
         return None
@@ -5287,6 +5837,55 @@ MISSION_REQUIRES = _apw_zonedata.skip_level_requires_map()
 # entry here is its effective grandparent(s), not its raw direct
 # predecessor(s) from ZoneData.py's own requires[] field.
 
+# A secret zone's "<Zone> Secret Access" item is recorded in the same persisted set as the Access
+# items, under the key "secret:<zone_internal_name>" (see secret_access_marker). When the world's
+# secret_missions_require_secret option is ON, a secret zone has ONE unlock item, its Secret Access
+# (it no longer has a separate Access item): entering it without that item is handled exactly like
+# any other locked zone (the player is killed on entry), and that same item counts as the zone's
+# Access for the zones after it. The client sets the flag from slot_data on connect.
+SECRET_ACCESS_PREFIX = "secret:"
+_SECRET_ACCESS_REQUIRED = False
+
+
+def secret_access_marker(zone_internal_name):
+    return SECRET_ACCESS_PREFIX + zone_internal_name
+
+
+def set_secret_access_required(required):
+    global _SECRET_ACCESS_REQUIRED
+    _SECRET_ACCESS_REQUIRED = bool(required)
+
+
+def _secret_access_applies(zone_name):
+    """True when this zone's ONE unlock item is its "<Zone> Secret Access" (option on + secret zone)."""
+    zinfo = _apw_zonedata.ZONES_BY_NAME.get(zone_name)
+    return bool(_SECRET_ACCESS_REQUIRED and zinfo and zinfo.secret)
+
+
+def _zone_item_received(zone_name, received_zone_items):
+    """Has the ONE item that unlocks this zone arrived (its Secret Access for a secret zone with the
+    option on, its Access item otherwise)?"""
+    if _secret_access_applies(zone_name):
+        return secret_access_marker(zone_name) in received_zone_items
+    return zone_name in received_zone_items
+
+
+def _secret_access_missing(zone_name, received_zone_items):
+    return _secret_access_applies(zone_name) and secret_access_marker(zone_name) not in received_zone_items
+
+
+def missing_zone_items(zone_name, received_zone_items):
+    """Display names of the items still missing to enter zone_name: ONE item per zone of the zone and
+    its predecessor chain (its Access item, or its Secret Access for a secret zone when the option is on)."""
+    names = []
+    for z in [zone_name] + list(MISSION_REQUIRES.get(zone_name, [])):
+        zinfo = _apw_zonedata.ZONES_BY_NAME.get(z)
+        label = zinfo.display_name if zinfo else z
+        if not _zone_item_received(z, received_zone_items):
+            names.append(f"{label} Secret Access" if _secret_access_applies(z) else f"{label} Access")
+    return names
+
+
 def is_zone_truly_unlocked(zone_name, received_zone_items, _seen=None):
     """A zone counts as unlocked only if its OWN Access item has been
     received AND every zone in its predecessor chain is ALSO unlocked,
@@ -5312,8 +5911,8 @@ def is_zone_truly_unlocked(zone_name, received_zone_items, _seen=None):
         _seen = frozenset()
     if zone_name in _seen:
         return False  # genuine cycle guard - shouldn't happen with real data
-    if zone_name not in received_zone_items:
-        return False
+    if not _zone_item_received(zone_name, received_zone_items):
+        return False  # its one unlock item (Access, or Secret Access for a secret zone) has not arrived yet
     new_seen = _seen | {zone_name}
     for predecessor in MISSION_REQUIRES.get(zone_name, []):
         if not is_zone_truly_unlocked(predecessor, received_zone_items, new_seen):
@@ -5322,8 +5921,1011 @@ def is_zone_truly_unlocked(zone_name, received_zone_items, _seen=None):
 
 
 
+# ------------------------------------------------------------
+# Map chest/secret counters, read straight off the in-game map widget.
+# Offsets come from the Dumper-7 SDK dump (chain below). The map widget only
+# exists in memory once a mission is loaded, so everything here returns None /
+# "not found" in the hub and menus rather than guessing.
+#
+#   UMG_MapWidget_C              +0x268  UMG_MapStatTrackerList*
+#   UMG_MapStatTrackerList_C     +0x230  Chests  (UMG_MapStatTracker*)
+#                                +0x238  Secrets (UMG_MapStatTracker*)
+#   UMG_MapStatTracker_C         +0x238  CurrentCount (UMG_MapStatTrackingCounter*)
+#                                +0x250  TotalCount   (UMG_MapStatTrackingCounter*)
+#   UMG_MapStatTrackingCounter_C +0x244  Count (int32)
+# ------------------------------------------------------------
+MAP_WIDGET_CLASS_NAME = "UMG_MapWidget_C"
+MAP_WIDGET_CLASS_LOOKUP_FILE = "map_widget_class.json"
+MAP_COUNTS_SEEN_FILE = "map_counts_seen.json"
+_MAP_WIDGET_STAT_LIST = 0x268
+_MAP_STAT_LIST_CHESTS = 0x230
+_MAP_STAT_LIST_SECRETS = 0x238
+_MAP_TRACKER_CURRENT = 0x238
+_MAP_TRACKER_TOTAL = 0x250
+_MAP_COUNTER_COUNT = 0x244
+_MAP_COUNT_MAX = 500   # anything above this is garbage, not a real chest/secret count
+
+# Expected class name at each step of the chain (used by map_counts to prove the offsets).
+_MAP_CHAIN_EXPECTED = {
+    "stat_list": "UMG_MapStatTrackerList_C",
+    "tracker": "UMG_MapStatTracker_C",
+    "counter": "UMG_MapStatTrackingCounter_C",
+}
+
+
+def _load_map_widget_class():
+    if os.path.exists(MAP_WIDGET_CLASS_LOOKUP_FILE):
+        try:
+            with open(MAP_WIDGET_CLASS_LOOKUP_FILE) as f:
+                return json.load(f).get("class_name_index")
+        except (OSError, ValueError):
+            pass
+    return None
+
+
+def _save_map_widget_class(class_name_index):
+    with open(MAP_WIDGET_CLASS_LOOKUP_FILE, "w") as f:
+        json.dump({"class_name_index": class_name_index}, f, indent=2)
+
+
+def _read_valid_ptr(pm, addr):
+    """Reads a pointer; returns 0 for null or obviously-not-a-pointer values."""
+    p = pm.read_longlong(addr)
+    return p if p and p > 0x10000 else 0
+
+
+def find_map_widget_instances(pm, base):
+    """Every UMG_MapWidget_C object currently in GObjects (this includes the class
+    default object, which has no tracker list - read_map_counts rejects it).
+    Slow-ish (one read per live UObject, ~650k): meant to be called rarely, not every tick.
+    The class is grouped by its UClass* so the name is only resolved once per class,
+    and the resulting class_name_index is cached in map_widget_class.json."""
+    snapshot = get_gobjects_pointer_snapshot(pm, base)
+    by_class = {}
+    for obj in snapshot.values():
+        if not obj:
+            continue
+        try:
+            class_ptr = pm.read_longlong(obj + 0x10)
+        except Exception:
+            continue
+        if class_ptr:
+            by_class.setdefault(class_ptr, []).append(obj)
+
+    cached_index = _load_map_widget_class()
+    found = []
+    for class_ptr, objs in by_class.items():
+        try:
+            name_index = pm.read_int(class_ptr + 0x18)
+        except Exception:
+            continue
+        if cached_index is not None and name_index != cached_index:
+            continue
+        if cached_index is None or resolve_fname(pm, name_index) == MAP_WIDGET_CLASS_NAME:
+            if cached_index is None:
+                _save_map_widget_class(name_index)
+                cached_index = name_index
+            found.extend(objs)
+    if not found and cached_index is not None:
+        # Cached index is stale (never matched anything) - forget it and resolve by name once.
+        try:
+            os.remove(MAP_WIDGET_CLASS_LOOKUP_FILE)
+        except OSError:
+            pass
+        for class_ptr, objs in by_class.items():
+            try:
+                name_index = pm.read_int(class_ptr + 0x18)
+            except Exception:
+                continue
+            if resolve_fname(pm, name_index) == MAP_WIDGET_CLASS_NAME:
+                _save_map_widget_class(name_index)
+                found.extend(objs)
+                break
+    return found
+
+
+def read_map_counts(pm, widget):
+    """Follows the pointer chain from one UMG_MapWidget_C instance and returns
+    {"chests": {"current": n, "total": m}, "secrets": {...}} or None if any link
+    is null / unreadable / out of range (hub, class default object, stale widget)."""
+    try:
+        stat_list = _read_valid_ptr(pm, widget + _MAP_WIDGET_STAT_LIST)
+        if not stat_list:
+            return None
+        out = {}
+        for key, offset in (("chests", _MAP_STAT_LIST_CHESTS), ("secrets", _MAP_STAT_LIST_SECRETS)):
+            tracker = _read_valid_ptr(pm, stat_list + offset)
+            if not tracker:
+                return None
+            current_counter = _read_valid_ptr(pm, tracker + _MAP_TRACKER_CURRENT)
+            total_counter = _read_valid_ptr(pm, tracker + _MAP_TRACKER_TOTAL)
+            if not current_counter or not total_counter:
+                return None
+            current = pm.read_int(current_counter + _MAP_COUNTER_COUNT)
+            total = pm.read_int(total_counter + _MAP_COUNTER_COUNT)
+            if not (0 <= current <= _MAP_COUNT_MAX and 0 <= total <= _MAP_COUNT_MAX):
+                return None
+            out[key] = {"current": current, "total": total}
+        return out
+    except Exception:
+        return None
+
+
+def describe_map_chain(pm, widget):
+    """Diagnostic: prints the class name found at every step of the chain next to the
+    one expected - the quickest way to prove the offsets are right (or find which one is off)."""
+    def cls(addr):
+        idx = get_uobject_class_name_index(pm, addr)
+        return resolve_fname(pm, idx) if idx is not None else None
+
+    def line(label, addr, expected):
+        got = cls(addr) if addr else None
+        ok = "OK " if got == expected else "BAD"
+        print(f"  [{ok}] {label:<28} @ {hex(addr) if addr else 'null':<16} class={got} (expected {expected})")
+
+    print(f"Widget {hex(widget)}  class={cls(widget)}")
+    try:
+        stat_list = _read_valid_ptr(pm, widget + _MAP_WIDGET_STAT_LIST)
+        line("MapWidget+0x268 stat list", stat_list, _MAP_CHAIN_EXPECTED["stat_list"])
+        if not stat_list:
+            return
+        for label, offset in (("Chests", _MAP_STAT_LIST_CHESTS), ("Secrets", _MAP_STAT_LIST_SECRETS)):
+            tracker = _read_valid_ptr(pm, stat_list + offset)
+            line(f"{label} tracker", tracker, _MAP_CHAIN_EXPECTED["tracker"])
+            if not tracker:
+                continue
+            for sub, toff in (("CurrentCount", _MAP_TRACKER_CURRENT), ("TotalCount", _MAP_TRACKER_TOTAL)):
+                counter = _read_valid_ptr(pm, tracker + toff)
+                line(f"{label}.{sub}", counter, _MAP_CHAIN_EXPECTED["counter"])
+                if counter:
+                    print(f"        Count = {pm.read_int(counter + _MAP_COUNTER_COUNT)}")
+    except Exception as e:
+        print(f"  chain read failed: {e}")
+
+
+BRIDGE_DEBUG_LOG = os.path.join(os.path.dirname(os.path.abspath(__file__)), "dungeons_bridge_debug.log")
+
+
+def _bridge_log_line(line):
+    """Appends one line to dungeons_bridge_debug.log - the same file the injected DLL
+    writes to (it sits next to dungeons_bridge.dll, i.e. next to this script, and the DLL
+    re-opens it in append mode for every line, so appending from here is safe). Never raises."""
+    try:
+        with open(BRIDGE_DEBUG_LOG, "a", encoding="utf-8") as f:
+            f.write(line + "\n")
+    except OSError:
+        pass
+
+
+def _log_map_counts(zone_name, zone_index, counts):
+    zone = zone_name or f"unknown_zone_{zone_index}"
+    _bridge_log_line(
+        f"[reader] map_counts: zone={zone} "
+        f"chests={counts['chests']['current']}/{counts['chests']['total']} "
+        f"secrets={counts['secrets']['current']}/{counts['secrets']['total']}")
+
+
+def _record_map_counts_seen(zone_name, counts):
+    """Keeps, per zone, every distinct chest/secret TOTAL ever read off the map
+    (a list, so a layout that varies between runs is visible instead of silently
+    overwritten) in map_counts_seen.json."""
+    seen = {}
+    try:
+        with open(MAP_COUNTS_SEEN_FILE, encoding="utf-8") as f:
+            seen = json.load(f)
+    except (OSError, ValueError):
+        pass
+    entry = seen.setdefault(zone_name, {"chests_total": [], "secrets_total": []})
+    changed = False
+    for key, field in (("chests", "chests_total"), ("secrets", "secrets_total")):
+        total = counts[key]["total"]
+        if total not in entry[field]:
+            entry[field] = sorted(entry[field] + [total])
+            changed = True
+    if changed:
+        try:
+            with open(MAP_COUNTS_SEEN_FILE, "w", encoding="utf-8") as f:
+                json.dump(seen, f, indent=2, sort_keys=True)
+        except OSError as e:
+            print(f"Could not save {MAP_COUNTS_SEEN_FILE}: {e}")
+    return entry
+
+
+# The chest / secret totals of the level come from the game's own counter actor (AMapStatActor in the SDK dump):
+# its replicated TrackedCounts array holds {EMapTrackingTypes, count} pairs. The map widget's text boxes
+# (UMG_MapStatTracker...) just display those numbers - reading them off the widgets gave garbage (395/395),
+# reading the actor needs no GObjects scan and no map widget.
+_MAP_STAT_ACTOR_CLASS = "MapStatActor"
+_MAP_STAT_TRACKED_COUNTS = 0x390     # AMapStatActor::TrackedCounts : TArray<FTrackedCount> (Data*, Num, Max)
+_MAP_TRACKING_NAMES = {0: "chests_opened", 1: "chests_spawned", 2: "secrets_found", 3: "secrets_spawned"}
+
+
+def find_map_stat_actor(pm, world, class_cache=None):
+    """Address of the level's MapStatActor, or None (hub, loading, level not ready)."""
+    cache = class_cache if class_cache is not None else {}
+    for addr, class_idx in scan_full_zone(pm, world).items():
+        if class_idx not in cache:
+            cache[class_idx] = resolve_fname(pm, class_idx) == _MAP_STAT_ACTOR_CLASS
+        if cache[class_idx]:
+            return addr
+    return None
+
+
+def read_map_stat_counts(pm, actor):
+    """{"chests": {"current": opened, "total": spawned}, "secrets": {...}} read from MapStatActor.TrackedCounts,
+    or None while the array is still empty / unreadable. 'total' is ChestsSpawned: it can still grow for a
+    little while after a level loads, so callers should keep reading for a while and keep the largest."""
+    try:
+        data = pm.read_longlong(actor + _MAP_STAT_TRACKED_COUNTS)
+        num = pm.read_int(actor + _MAP_STAT_TRACKED_COUNTS + 8)
+        if not data or not (0 < num <= 16):
+            return None
+        raw = pm.read_bytes(data, num * 8)
+        vals = {}
+        for k in range(num):
+            kind = raw[k * 8]
+            count = struct.unpack_from("<i", raw, k * 8 + 4)[0]
+            if kind in _MAP_TRACKING_NAMES and 0 <= count <= _MAP_COUNT_MAX:
+                vals[_MAP_TRACKING_NAMES[kind]] = count
+        return {"chests": {"current": vals.get("chests_opened", 0), "total": vals.get("chests_spawned", 0)},
+                "secrets": {"current": vals.get("secrets_found", 0), "total": vals.get("secrets_spawned", 0)}}
+    except Exception:
+        return None
+
+
+def _known_count_note(zone_name, chest_total):
+    """How the map's chest total compares with the count the client already knows for a base-game zone -
+    this is what tells whether the map total includes the supply chests."""
+    known = _apw_locations.ZONE_CHEST_COUNTS.get(zone_name)
+    if not known:
+        return ""
+    if chest_total == known[0]:
+        return f"  [= the known {known[0]} chest(s); supply chests not counted]"
+    if chest_total == known[0] + known[1]:
+        return f"  [= the known {known[0]} chest(s) + {known[1]} supply chest(s)]"
+    return f"  [differs from the known {known[0]} chest(s) + {known[1]} supply]"
+
+
+class MapCountAnnouncer:
+    """Devtool mapping chest count, at the start of every mission zone: logs the chest count the client
+    already knows for it (ZONE_CHEST_COUNTS) right away, then reads the level's real chest/secret counters
+    (MapStatActor) a few seconds later and again every RETRY_INTERVAL while the total keeps changing -
+    in `say` AND in dungeons_bridge_debug.log with the zone, and in map_counts_seen.json (every distinct
+    total seen per zone: the LARGEST one is the zone's chest count).
+
+    Two phases so the AP client's game loop never waits on a read:
+      check_zone(pm, base)  - cheap, call every tick; True when a read is due.
+      attempt(pm, base)     - one level-actor scan; run it in a worker thread, one at a time (busy flag)."""
+
+    FIRST_DELAY = 6.0      # seconds after entering a zone before the first read
+    RETRY_INTERVAL = 3.0
+    MAX_ATTEMPTS = 50      # ~2.5 minutes of watching per zone: enough for the level to finish streaming in
+    STABLE_READS_TO_STOP = 4   # that many identical reads in a row (~12 s) = the counters have settled, stop
+
+    def __init__(self, say=print):
+        self.say = say
+        self.zone_key = object()
+        self.zone_name = None
+        self.zone_index = None
+        self.entered_at = 0.0
+        self.last_attempt = 0.0
+        self.attempts = 0
+        self.done = True       # nothing to do until a mission zone is entered
+        self.busy = False
+        self.class_cache = {}
+        self.last_counts = None
+        self.stable_reads = 0   # consecutive reads that gave the same counters
+
+    def check_zone(self, pm, base):
+        try:
+            world = pm.read_longlong(base + OFFSETS["gworld"])
+        except Exception:
+            return False
+        if not world:
+            return False
+        zone_index = get_zone_name_index(pm, world)
+        if zone_index == 0:
+            return False   # loading screen
+        if zone_index != self.zone_key:
+            self.zone_key = zone_index
+            self.attempts = 0
+            self.last_attempt = 0.0
+            self.last_counts = None
+            self.stable_reads = 0
+            self.entered_at = time.time()
+            self.zone_index = zone_index
+            if zone_index is None:
+                self.zone_name = "hub"
+                self.done = True
+            else:
+                self.zone_name = ZONE_NAME_LOOKUP.get(zone_index, f"unknown_zone_{zone_index}")
+                self.done = False
+                known = _apw_locations.ZONE_CHEST_COUNTS.get(self.zone_name)
+                if known:
+                    msg = f"[{self.zone_name}] zone start: {known[0]} chest(s) + {known[1]} supply chest(s) (known count)"
+                    _bridge_log_line(f"[reader] zone_start: zone={self.zone_name} known_chests={known[0]} known_supply={known[1]}")
+                else:
+                    msg = f"[{self.zone_name}] zone start: chest count not confirmed yet (reading the level's counters...)"
+                    _bridge_log_line(f"[reader] zone_start: zone={self.zone_name} known_chests=unknown")
+                self.say(msg)
+        if self.done or self.attempts >= self.MAX_ATTEMPTS:
+            return False
+        now = time.time()
+        if self.attempts == 0:
+            return now - self.entered_at >= self.FIRST_DELAY
+        return now - self.last_attempt >= self.RETRY_INTERVAL
+
+    def attempt(self, pm, base):
+        zone_at_start = self.zone_key
+        self.attempts += 1
+        self.last_attempt = time.time()
+        counts = None
+        world = 0
+        try:
+            world = pm.read_longlong(base + OFFSETS["gworld"])
+            actor = find_map_stat_actor(pm, world, self.class_cache) if world else None
+            counts = read_map_stat_counts(pm, actor) if actor else None
+        except Exception:
+            counts = None
+        if zone_at_start != self.zone_key:
+            return   # the zone changed while reading: this result belongs to the old zone
+        if not counts:
+            if self.attempts >= self.MAX_ATTEMPTS and self.last_counts is None:
+                self.say(f"[{self.zone_name}] could not read the level's chest counter (MapStatActor not found)")
+                _bridge_log_line(f"[reader] map_counts: zone={self.zone_name} not_found")
+            return
+        if counts == self.last_counts:
+            self.stable_reads += 1
+            if self.stable_reads >= self.STABLE_READS_TO_STOP:
+                self.done = True     # the level has finished streaming in: stop scanning it every few seconds
+            return
+        self.stable_reads = 0
+        first = self.last_counts is None
+        self.last_counts = counts
+        total = counts["chests"]["total"]
+        self.say(f"[{self.zone_name}] " + ("map: " if first else "map changed: ")
+                 + f"chests {counts['chests']['current']}/{total}, secrets "
+                   f"{counts['secrets']['current']}/{counts['secrets']['total']}"
+                 + _known_count_note(self.zone_name, total))
+        _log_map_counts(self.zone_name, self.zone_index, counts)
+        _record_map_counts_seen(self.zone_name, counts)
+
+
+def watch_map_counts(pm, base, interval=2.0):
+    """Devtool mapping chest count: follows wherever you are and prints the chest/secret counters of each
+    zone from the level's MapStatActor (every change), recording them in map_counts_seen.json. Ctrl+C stops."""
+    class_cache, last_zone, last_counts = {}, object(), None
+    print("Watching the level's chest counters. Ctrl+C to stop.")
+    while True:
+        try:
+            world = pm.read_longlong(base + OFFSETS["gworld"])
+        except Exception:
+            world = 0
+        if not world:
+            time.sleep(interval)
+            continue
+        zone_index = get_zone_name_index(pm, world)
+        if zone_index != last_zone:
+            last_zone, last_counts = zone_index, None
+        zone_name = ZONE_NAME_LOOKUP.get(zone_index) if zone_index is not None else None
+        actor = find_map_stat_actor(pm, world, class_cache) if zone_name else None
+        counts = read_map_stat_counts(pm, actor) if actor else None
+        if counts and counts != last_counts:
+            last_counts = counts
+            entry = _record_map_counts_seen(zone_name, counts)
+            print(f"[{zone_name}] chests {counts['chests']['current']}/{counts['chests']['total']}, secrets "
+                  f"{counts['secrets']['current']}/{counts['secrets']['total']}   (totals seen: chests "
+                  f"{entry['chests_total']}, secrets {entry['secrets_total']})"
+                  + _known_count_note(zone_name, counts["chests"]["total"]))
+            _log_map_counts(zone_name, zone_index, counts)
+        time.sleep(interval)
+
+
+# ------------------------------------------------------------
+# Devtool mapping powerful mobs
+#
+# Measures, zone by zone and run by run, whether a "powerful" mob (mini boss,
+# AMobCharacter::IsEventMob() in the SDK dump) is present and whether it gets
+# killed. Result: powerful_mobs_seen.json ("present in 4 of 5 runs") and lines
+# in dungeons_bridge_debug.log. Used to decide which zones can safely get a
+# "Powerful Mob" check. Offsets from the Dumper-7 dump of AMobCharacter.
+# ------------------------------------------------------------
+POWERFUL_MOBS_SEEN_FILE = "powerful_mobs_seen.json"
+_MOB_ENTITY_TYPE_OFFSET = 0xBA0         # AMobCharacter::EntityType (uint32)
+_MOB_REPLICATED_FLAGS_OFFSET = 0xD37    # AMobCharacter::mMobReplicatedFlags (uint8)
+_MOB_CLASS_NAME = "MobCharacter"        # native class name of AMobCharacter
+
+ENTITY_TYPE_NAMES = {
+    1: "Undefined",
+    14: "Wolf",
+    16: "Mooshroom",
+    18: "Rabbit",
+    19: "Bat",
+    64: "ItemEntity",
+    65: "PrimedTnt",
+    66: "FallingBlock",
+    67: "MovingBlock",
+    68: "ExperiencePotion",
+    69: "Experience",
+    70: "EyeOfEnder",
+    71: "EnderCrystal",
+    76: "ShulkerBullet",
+    77: "FishingHook",
+    78: "Chalkboard",
+    79: "DragonFireball",
+    80: "Arrow",
+    81: "Snowball",
+    82: "ThrownEgg",
+    83: "Painting",
+    85: "LargeFireball",
+    86: "ThrownPotion",
+    87: "Enderpearl",
+    88: "LeashKnot",
+    89: "WitherSkull",
+    90: "BoatRideable",
+    91: "WitherSkullDangerous",
+    93: "LightningBolt",
+    94: "SmallFireball",
+    95: "AreaEffectCloud",
+    101: "LingeringPotion",
+    132: "Dummy",
+    199: "Goat",
+    204: "Ocelot",
+    205: "PlayfulPanda",
+    206: "LazyPanda",
+    207: "BrownPanda",
+    208: "Leaper",
+    209: "Whisperer",
+    210: "JungleAbomination",
+    211: "QuickGrowingVineSimple",
+    212: "PoisonQuillVineSimple",
+    213: "EntangleVine",
+    214: "AbominationVine",
+    215: "BabyPanda",
+    216: "Parrot",
+    217: "Panda",
+    218: "BabyChicken",
+    222: "PolarBear",
+    223: "ArcticFox",
+    224: "Illusioner",
+    225: "IllusionerClone",
+    226: "Chillager",
+    228: "Bee",
+    229: "SheepFireRed",
+    230: "SheepPoisonGreen",
+    231: "SheepSpeedBlue",
+    232: "BabyPig",
+    233: "Ravager",
+    234: "WoolyCow",
+    235: "LlamaMob",
+    237: "WindCaller",
+    238: "BabyGoat",
+    239: "SquallGolem",
+    240: "Mountaineer",
+    241: "MountaineerVariant0",
+    242: "MountaineerVariant1",
+    243: "MountaineerVariant2",
+    244: "TempestGolem",
+    245: "RampartCaptain",
+    246: "Hoglin",
+    251: "PiglinMelee",
+    252: "PiglinMeleeVariant0",
+    253: "PiglinMeleeVariant1",
+    254: "PiglinMeleeVariant2",
+    255: "PiglinRanged",
+    256: "PiglinRangedVariant0",
+    257: "PiglinRangedVariant1",
+    258: "PiglinRangedVariant2",
+    267: "BabyGhast",
+    270: "MooshroomAncient",
+    283: "JungleAbominationRemix",
+    284: "TreetopWhisperer",
+    285: "TreetopLeaper",
+    312: "BabyTurtlePet",
+    316: "AncientGuardian",
+    317: "AncientGuardianMine",
+    318: "Biomine",
+    327: "WaveWhisperer",
+    328: "PoisonAnemone",
+    329: "QuickGrowingKelp",
+    343: "Friendermite",
+    345: "BabySquid",
+    346: "DarkBabyGoat",
+    347: "Duck",
+    348: "Fox",
+    349: "GoldAxolotl",
+    350: "GoldenParrot",
+    351: "Raven",
+    352: "BabyRubyTurtle",
+    353: "SpottedBabyPig",
+    354: "Toucan",
+    355: "ZombifiedBabyPig",
+    356: "StoneMinistrosity",
+    357: "RedstoneMinistrosity",
+    358: "GlowingMinistrosity",
+    359: "WildAxolotl",
+    360: "AxolotlLeucistic",
+    361: "SmallSpider",
+    362: "Mole",
+    363: "MiniAbomination",
+    364: "GlowingMiniAbomination",
+    365: "BabyMoobloom",
+    366: "BabyDairyCow",
+    367: "RedPanda",
+    368: "RedCat",
+    369: "BrownTabby",
+    370: "BabyPiebaldPig",
+    371: "Hedgehog",
+    372: "BabyWoolyCow",
+    373: "CalicoCat",
+    374: "Cluckshroom",
+    375: "DesertRabbit",
+    376: "EmperorPenguin",
+    377: "FancyChicken",
+    378: "GreyTabby",
+    379: "RoyalPenguin",
+    380: "SootyPig",
+    381: "VestedRabbit",
+    382: "Raccoon",
+    383: "Skunk",
+    384: "SableWeasel",
+    385: "CinnamonWeasel",
+    386: "Phantom",
+    401: "TowerGuard",
+    402: "TowerWraith",
+    403: "ActiveSquallGolem",
+    511: "TypeMask",
+    512: "Mob",
+    520: "LeaperAncient",
+    527: "Villager",
+    532: "IronGolem",
+    533: "SnowGolem",
+    540: "GoatAncient",
+    560: "HoglinAncient",
+    563: "Npc",
+    568: "Agent",
+    574: "TripodCamera",
+    575: "Player",
+    576: "GeomancerWall",
+    577: "GeomancerBomb",
+    585: "PiggyBank",
+    586: "GoldBabyKey",
+    587: "SilverBabyKey",
+    652: "NecromancerAncient",
+    662: "WitchAncient",
+    672: "VexAncient",
+    682: "RoyalGuardAncient",
+    692: "WraithAncient",
+    702: "BabyZombieAncient",
+    714: "QuickGrowingVine",
+    715: "PoisonQuillVine",
+    762: "ChickenJockeyTowerAncient",
+    792: "MagmaCubeLarge",
+    793: "MagmaCubeMedium",
+    794: "MagmaCubeSmall",
+    802: "SkeletonVanguardAncient",
+    831: "Blastling",
+    832: "Snareling",
+    833: "Endling",
+    834: "EndermiteSmart",
+    835: "SilverfishSmart",
+    836: "Endersent",
+    837: "EndersentThornblight",
+    838: "EndersentVoidstrike",
+    839: "EndersentWritherot",
+    840: "EndersentEverfire",
+    841: "EndersentSurgefiend",
+    842: "EndersentDeadeye",
+    843: "Seravex",
+    1012: "EnchanterAncient",
+    1015: "SnarelingAncient",
+    1021: "EndlingAncient",
+    2560: "Monster",
+    2578: "GeomancerAncient",
+    2588: "RedstoneGolem",
+    2589: "Enchanter",
+    2590: "Vindicator",
+    2593: "Creeper",
+    2598: "BlazeSpawnerAncient",
+    2601: "Ghast",
+    2603: "Blaze",
+    2605: "Witch",
+    2609: "Guardian",
+    2610: "ElderGuardian",
+    2613: "Dragon",
+    2614: "Shulker",
+    2618: "Vex",
+    2619: "Evoker",
+    2620: "EvokerFang",
+    2621: "Geomancer",
+    2627: "SlimeLarge",
+    2628: "SlimeMedium",
+    2629: "SlimeSmall",
+    2630: "RedstoneMonstrosity",
+    2632: "RedstoneCube",
+    2637: "Pillager",
+    2640: "MobSpawner",
+    2642: "OrdinaryHorse",
+    2643: "CauldronBoss",
+    2644: "SlimeCauldron",
+    2645: "ArchIllager",
+    2646: "JackOLantern",
+    2647: "RoyalGuard",
+    2649: "VindicatorChef",
+    2650: "Llama",
+    2652: "Enderman",
+    2680: "PillagerVariant0",
+    2681: "PillagerVariant1",
+    2682: "PillagerVariant2",
+    2683: "PillagerAncient",
+    2685: "VindicatorVariant0",
+    2686: "VindicatorVariant1",
+    2687: "VindicatorVariant2",
+    2688: "ArchVessel",
+    2689: "ArchVisage",
+    2691: "MooshroomMonstrosity",
+    2779: "ChargedCreeper",
+    2781: "IcyCreeper",
+    2786: "SoulWizard",
+    2809: "BlazeSpawner",
+    2810: "HoveringInferno",
+    2820: "RedstoneGolemAncient",
+    2821: "PiglinFungusThrower",
+    2823: "ZombifiedPiglinFungusThrower",
+    2860: "TropicalSlimeLarge",
+    2861: "TropicalSlimeMedium",
+    2862: "TropicalSlimeSmall",
+    2873: "VindicatorRaidCaptain",
+    2874: "PillagerRaidCaptain",
+    2893: "PerfectFormHeart",
+    2904: "ShulkerRespawning",
+    3047: "GuardianAncient",
+    3070: "SlimeSmallAncient",
+    4608: "Animal",
+    4618: "Chicken",
+    4619: "Cow",
+    4620: "Pig",
+    4621: "Sheep",
+    8704: "WaterAnimal",
+    9007: "Squid",
+    9008: "Turtle",
+    9009: "BabyTurtle",
+    9010: "Pufferfish",
+    9012: "Dolphin",
+    9019: "GlowSquid",
+    20992: "TamableAnimal",
+    33280: "Ambient",
+    68096: "UndeadMob",
+    68132: "ZombifiedPiglin",
+    68148: "WitherBoss",
+    68177: "SkeletonHorseman",
+    68355: "ZombifiedPiglinMelee",
+    68356: "ZombifiedPiglinMeleeVariant0",
+    68357: "ZombifiedPiglinMeleeVariant1",
+    68358: "ZombifiedPiglinMeleeVariant2",
+    68359: "ZombifiedPiglinRanged",
+    68360: "ZombifiedPiglinRangedVariant0",
+    68361: "ZombifiedPiglinRangedVariant1",
+    68362: "ZombifiedPiglinRangedVariant2",
+    199168: "ZombieMonster",
+    199199: "BabyZombie",
+    199200: "Zombie",
+    199212: "ZombieVillager",
+    199215: "Husk",
+    199234: "ChickenJockey",
+    199268: "ChickenJockeyTower",
+    199278: "ZombieVariant0",
+    199279: "ZombieVariant1",
+    199280: "ZombieVariant2",
+    199281: "ZombieAncient",
+    199368: "JungleZombie",
+    199388: "FrozenZombie",
+    199475: "Drowned",
+    199477: "TridentDrowned",
+    199492: "BabyDrowned",
+    199502: "DrownedVariant0",
+    199503: "DrownedVariant1",
+    199504: "DrownedVariant2",
+    199505: "TridentDrownedVariant0",
+    199506: "TridentDrownedVariant1",
+    199507: "TridentDrownedVariant2",
+    199659: "DrownedAncient",
+    264704: "Arthropod",
+    264739: "Spider",
+    264743: "Silverfish",
+    264744: "CaveSpider",
+    264759: "Endermite",
+    264984: "SpiderAncient",
+    265036: "EndermiteMinion",
+    265203: "SilverfishAncient",
+    524288: "Minecart",
+    524384: "MinecartHopper",
+    524385: "MinecartTNT",
+    524386: "MinecartChest",
+    524387: "MinecartFurnace",
+    1116672: "SkeletonMonster",
+    1116706: "Skeleton",
+    1116718: "Stray",
+    1116720: "WitherSkeleton",
+    1116729: "Necromancer",
+    1116743: "Wraith",
+    1116748: "NamelessKing",
+    1116750: "FalseKing",
+    1116751: "SkeletonVanguard",
+    1116787: "SkeletonVariant0",
+    1116788: "SkeletonVariant1",
+    1116789: "SkeletonVariant2",
+    1116790: "SkeletonAncient",
+    1116861: "TheOneWhoCalls",
+    1116873: "MossySkeleton",
+    1116899: "WickedWraith",
+    1116934: "WitherSkeletonRanged",
+    1116982: "SunkenSkeleton",
+    1116983: "DrownedNecromancer",
+    1117012: "SunkenSkeletonVariant0",
+    1117013: "SunkenSkeletonVariant1",
+    1117014: "SunkenSkeletonVariant2",
+    2118144: "EquineAnimal",
+    2118167: "Horse",
+    2118168: "Donkey",
+    2118169: "Mule",
+    2185754: "SkeletonHorse",
+    2185755: "ZombieHorse",
+}
+
+
+def entity_type_name(value):
+    return ENTITY_TYPE_NAMES.get(value, f"EntityType{value}")
+
+
+def _is_mob_class(pm, class_ptr):
+    """True if class_ptr is AMobCharacter or inherits from it."""
+    for cls in walk_super_chain(pm, class_ptr):
+        try:
+            if resolve_fname(pm, pm.read_int(cls + OFFSETS["uobject_name"])) == _MOB_CLASS_NAME:
+                return True
+        except Exception:
+            return False
+    return False
+
+
+def _find_function_on_class(pm, class_ptr, wanted_name):
+    """Address of the UFunction called wanted_name on class_ptr or any parent, else None."""
+    for cls in walk_super_chain(pm, class_ptr):
+        for child in walk_children(pm, cls):
+            if get_ufunction_name(pm, child) == wanted_name:
+                return child
+    return None
+
+
+def _call_bool_function(pm, obj_addr, func_addr):
+    """Calls a parameterless UFunction returning a single bool (ReturnValue at offset 0).
+    Returns True/False, or None if the call failed."""
+    success, _, after = call_process_event(pm, obj_addr, func_addr, bytes(8))
+    if not success or not after:
+        return None
+    return bool(after[0])
+
+
+# Mini bosses the game does NOT flag with IsEventMob (the Raid Captains answer IsEventMob=False, flags=0x02, the same
+# flag byte as ordinary "variant" mobs) but that are mini bosses all the same: a kill counts as a powerful-mob kill.
+# They cannot be summoned (see miniboss.py), they only show up in missions. Names as entity_type_name() gives them.
+_ALWAYS_MINIBOSS_ENTITY_NAMES = frozenset({"PillagerRaidCaptain", "VindicatorRaidCaptain"})
+
+
+def _evaluate_mob(pm, actor, class_ptr, func_cache):
+    """Reads EntityType + the replicated flags byte and asks the game itself
+    (IsEventMob) whether this mob is a powerful mob. Returns a dict, or None if unreadable."""
+    try:
+        etype = pm.read_uint(actor + _MOB_ENTITY_TYPE_OFFSET)
+        flags = pm.read_bytes(actor + _MOB_REPLICATED_FLAGS_OFFSET, 1)[0]
+    except Exception:
+        return None
+    if "IsEventMob" not in func_cache:
+        func_cache["IsEventMob"] = _find_function_on_class(pm, class_ptr, "IsEventMob")
+    func = func_cache["IsEventMob"]
+    event = _call_bool_function(pm, actor, func) if func else None
+    powerful = bool(event) or entity_type_name(etype) in _ALWAYS_MINIBOSS_ENTITY_NAMES
+    return {"etype": etype, "flags": flags, "event": event, "powerful": powerful}
+
+
+def _new_powerful_run(zone_name):
+    return {"zone": zone_name, "mobs_seen": 0, "seen_types": set(), "killed_types": set()}
+
+
+def _commit_powerful_run(run, say=print):
+    """Adds one finished run to powerful_mobs_seen.json. Runs where no mob at all was
+    ever seen (hub, menus) are ignored. Returns the zone's updated entry, or None."""
+    if not run or not run["zone"] or run["mobs_seen"] == 0:
+        return None
+    data = {}
+    try:
+        with open(POWERFUL_MOBS_SEEN_FILE, encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        pass
+    entry = data.setdefault(run["zone"], {"runs": 0, "runs_with_powerful_seen": 0,
+                                          "runs_with_powerful_killed": 0, "types": {}})
+    entry["runs"] += 1
+    if run["seen_types"]:
+        entry["runs_with_powerful_seen"] += 1
+    if run["killed_types"]:
+        entry["runs_with_powerful_killed"] += 1
+    for t in run["seen_types"] | run["killed_types"]:
+        rec = entry["types"].setdefault(t, {"seen_runs": 0, "killed_runs": 0})
+        if t in run["seen_types"]:
+            rec["seen_runs"] += 1
+        if t in run["killed_types"]:
+            rec["killed_runs"] += 1
+    try:
+        with open(POWERFUL_MOBS_SEEN_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, sort_keys=True)
+    except OSError as e:
+        print(f"Could not save {POWERFUL_MOBS_SEEN_FILE}: {e}")
+    _bridge_log_line(
+        f"[reader] powerful_mob_run: zone={run['zone']} runs={entry['runs']} "
+        f"seen_in={entry['runs_with_powerful_seen']} killed_in={entry['runs_with_powerful_killed']} "
+        f"this_run_seen={sorted(run['seen_types'])} this_run_killed={sorted(run['killed_types'])}")
+    say(f"[{run['zone']}] run recorded: powerful seen {sorted(run['seen_types']) or 'none'}, "
+          f"killed {sorted(run['killed_types']) or 'none'}  -> present in "
+          f"{entry['runs_with_powerful_seen']}/{entry['runs']} run(s), killed in "
+          f"{entry['runs_with_powerful_killed']}/{entry['runs']}")
+    return entry
+
+
+def print_powerful_mobs_report():
+    try:
+        with open(POWERFUL_MOBS_SEEN_FILE, encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        print(f"No {POWERFUL_MOBS_SEEN_FILE} yet - run watch_powerful_mobs and play some missions first.")
+        return
+    print(f"{'zone':<34}{'runs':>5}{'seen':>6}{'killed':>8}  types (seen/killed runs)")
+    for zone, e in sorted(data.items()):
+        types = ", ".join(f"{t} ({r['seen_runs']}/{r['killed_runs']})" for t, r in sorted(e["types"].items()))
+        flag = "" if e["runs_with_powerful_seen"] == e["runs"] else ("  <- NOT every run" if e["runs_with_powerful_seen"] else "  <- never seen")
+        print(f"{zone:<34}{e['runs']:>5}{e['runs_with_powerful_seen']:>6}{e['runs_with_powerful_killed']:>8}  {types or '-'}{flag}")
+
+
+class PowerfulMobTracker:
+    """Devtool mapping powerful mobs, as a reusable piece: feed it one tick at a time
+    (tick) and it tracks the zone, checks every mob of the zone once (IsEventMob asked to the
+    game), notes powerful-mob kills from the DLL's death events, and stores one finished
+    "run" per zone visit in powerful_mobs_seen.json. Everything notable is also appended
+    to dungeons_bridge_debug.log together with the zone. Used both by the standalone
+    watch_powerful_mobs command and by the AP client's game_watcher (passive logging while
+    you play - it never sends a check). Not thread-safe: call it from one thread at a time."""
+
+    def __init__(self, say=print, scan_interval=3.0, max_new_evals=25, max_new_class_checks=40):
+        self.say = say
+        self.scan_interval = scan_interval
+        self.max_new_evals = max_new_evals
+        self.max_new_class_checks = max_new_class_checks
+        self.mob_class_cache = {}   # class_name_index -> bool (is it an AMobCharacter?)
+        self.func_cache = {}
+        self.evaluated = {}         # actor address -> evaluation dict, cleared on zone change
+        self.probes_printed = set()
+        self.run = None
+        self.zone_key = object()
+        self.last_scan = 0.0
+
+    def new_zone(self, zone_name):
+        _commit_powerful_run(self.run, self.say)
+        self.run = _new_powerful_run(zone_name)
+        self.evaluated.clear()
+        self.last_scan = 0.0
+
+    def finish(self):
+        _commit_powerful_run(self.run, self.say)
+        self.run = None
+
+    def _probe(self, info):
+        name = entity_type_name(info["etype"])
+        combo = (name, info["flags"], info["event"])
+        if combo not in self.probes_printed:
+            self.probes_printed.add(combo)
+            self.say(f"   powerful-mob probe: {name} ({info['etype']}) flags=0x{info['flags']:02X} "
+                     f"IsEventMob={info['event']} powerful={info['powerful']}")
+        return name
+
+    def scan(self, pm, world):
+        snapshot = scan_full_zone_shared(pm, world, max_age=0.5)   # shared with the Eye of Ender scan
+        for stale in set(self.evaluated) - set(snapshot):
+            del self.evaluated[stale]
+        new_evals = 0
+        new_class_checks = 0
+        for addr, class_idx in snapshot.items():
+            if addr in self.evaluated or new_evals >= self.max_new_evals:
+                continue
+            try:
+                class_ptr = pm.read_longlong(addr + OFFSETS["uobject_class"])
+            except Exception:
+                continue
+            if class_idx not in self.mob_class_cache:
+                if new_class_checks >= self.max_new_class_checks:
+                    continue   # spread the (pipe-heavy) first-time class checks over several scans
+                new_class_checks += 1
+                self.mob_class_cache[class_idx] = _is_mob_class(pm, class_ptr) if class_ptr else False
+            if not self.mob_class_cache[class_idx]:
+                continue
+            info = _evaluate_mob(pm, addr, class_ptr, self.func_cache)
+            new_evals += 1
+            if info is None:
+                continue
+            self.evaluated[addr] = info
+            self.run["mobs_seen"] += 1
+            name = self._probe(info)
+            if info["powerful"] and name not in self.run["seen_types"]:
+                self.run["seen_types"].add(name)
+                self.say(f"[{self.run['zone']}] powerful mob present: {name}")
+                _bridge_log_line(f"[reader] powerful_mob: zone={self.run['zone']} seen type={name}")
+
+    def handle_deaths(self, pm, addrs):
+        for addr in addrs:
+            info = self.evaluated.get(addr)
+            if info is None:
+                try:
+                    class_ptr = pm.read_longlong(addr + OFFSETS["uobject_class"])
+                    if class_ptr and _is_mob_class(pm, class_ptr):
+                        info = _evaluate_mob(pm, addr, class_ptr, self.func_cache)
+                except Exception:
+                    info = None
+            if info and info["powerful"]:
+                name = self._probe(info)
+                if name not in self.run["killed_types"]:
+                    self.run["killed_types"].add(name)
+                    self.run["seen_types"].add(name)
+                    self.say(f"[{self.run['zone']}] powerful mob KILLED: {name}")
+                    _bridge_log_line(f"[reader] powerful_mob: zone={self.run['zone']} killed type={name}")
+
+    def tick(self, pm, base, death_addrs=()):
+        """One step. death_addrs = actor addresses drained from get_death_events this tick."""
+        try:
+            world = pm.read_longlong(base + OFFSETS["gworld"])
+        except Exception:
+            return
+        if not world:
+            return
+        zone_index = get_zone_name_index(pm, world)
+        if zone_index == 0:
+            return   # loading screen: keep the current run as it is
+        if zone_index != self.zone_key:
+            self.zone_key = zone_index
+            if zone_index is None:
+                zone_name = "hub"
+            else:
+                zone_name = ZONE_NAME_LOOKUP.get(zone_index, f"unknown_zone_{zone_index}")
+            self.new_zone(zone_name)
+        if time.time() - self.last_scan >= self.scan_interval:
+            self.last_scan = time.time()
+            self.scan(pm, world)
+        if death_addrs:
+            self.handle_deaths(pm, death_addrs)
+
+
+def watch_powerful_mobs(pm, base):
+    """Standalone Devtool mapping powerful mobs: python dungeons_reader.py watch_powerful_mobs.
+    The AP client does the same thing passively (see POWERFUL_MOB_LOGGING there)."""
+    tracker = PowerfulMobTracker(say=print)
+    print("Watching powerful mobs. Play a mission; leave it (back to camp) to close the run. Ctrl+C to stop.")
+    try:
+        while True:
+            tracker.tick(pm, base, get_death_events(pm) or [])
+            time.sleep(1.0)
+    except KeyboardInterrupt:
+        print("\nStopping...")
+    finally:
+        tracker.finish()
+
+
 if __name__ == "__main__":
     import sys
+
+    if len(sys.argv) > 1 and sys.argv[1] == "powerful_mobs_report":
+        # python dungeons_reader.py powerful_mobs_report
+        # Devtool mapping powerful mobs (only reads the JSON - the game doesn't need to be running)
+        print_powerful_mobs_report()
+        sys.exit(0)
 
     pm, base = attach()
 
@@ -5334,6 +6936,28 @@ if __name__ == "__main__":
             print("No UWorld - are you in a level?")
         else:
             watch_for_drops(pm, world)
+    elif len(sys.argv) > 1 and sys.argv[1] == "map_counts":
+        # python dungeons_reader.py map_counts
+        # Devtool mapping chest count
+        _world = pm.read_longlong(base + OFFSETS["gworld"])
+        _actor = find_map_stat_actor(pm, _world) if _world else None
+        _counts = read_map_stat_counts(pm, _actor) if _actor else None
+        if not _counts:
+            print("No MapStatActor / empty TrackedCounts - are you inside a mission (not the hub)? Try again in a few seconds.")
+        else:
+            _zone_index = get_zone_name_index(pm, _world, min_interval=0)
+            _zone = ZONE_NAME_LOOKUP.get(_zone_index) if _zone_index is not None else None
+            print(f"[{_zone}] chests {_counts['chests']['current']}/{_counts['chests']['total']}, secrets "
+                  f"{_counts['secrets']['current']}/{_counts['secrets']['total']}" + _known_count_note(_zone, _counts['chests']['total']))
+            _log_map_counts(_zone, _zone_index, _counts)
+    elif len(sys.argv) > 1 and sys.argv[1] == "watch_map_counts":
+        # python dungeons_reader.py watch_map_counts
+        # Devtool mapping chest count
+        watch_map_counts(pm, base)
+    elif len(sys.argv) > 1 and sys.argv[1] == "watch_powerful_mobs":
+        # python dungeons_reader.py watch_powerful_mobs
+        # Devtool mapping powerful mobs
+        watch_powerful_mobs(pm, base)
     elif len(sys.argv) > 1 and sys.argv[1] == "set_store":
         # python dungeons_reader.py set_store <steam|minecraft_launcher|microsoft_store>
         # One-time setting, persisted in DATA_DIR - selects which

@@ -4,16 +4,21 @@ from BaseClasses import Region, Entrance, LocationProgressType
 
 from .ZoneData import ZONES, ANCIENT_HUNT_ZONES, ZoneInfo, ZONES_BY_NAME, skip_level_requires_map
 from .Locations import (
+    SECRET_ZONE_FOUND_BY_ZONE, SECRET_PARENT_TO_ZONE,
     LOCATIONS_BY_ZONE, LOCATION_TABLE, get_emerald_milestone_locations,
     get_emerald_milestone_id, milestone_location_name,
     BOSS_KILL_TABLE, BOSS_ZONE, boss_kill_location_name,
     get_base_boss_names, get_dlc_boss_names,
+    MINI_BOSS_KILL_TABLE, mini_boss_kill_location_name, wanted_mini_boss_zones, wanted_mini_boss_type_homes,
+    MINI_BOSS_TYPE_TABLE, mini_boss_type_location_name,
+    EYE_OF_ENDER_TYPES, EYE_OF_ENDER_TABLE, eye_of_ender_location_name,
+    VILLAGER_TYPES, VILLAGER_TABLE, villager_location_name,
     ANCIENT_HUNT_BOSS_KILL_TABLE, ancient_hunt_boss_kill_location_name,
     ZONE_CHEST_COUNTS, ZONE_CHEST_TABLE, zone_chest_location_name, zone_supply_chest_location_name,
     get_bonus_chest_locations,
 )
 from .Rules import make_zone_rule, make_ancient_hunt_rule
-from .Options import GoalMission, GOAL_MISSION_ID_TO_ZONE
+from .Options import GoalMission, GOAL_MISSION_ID_TO_ZONE, DLC_PACK_BY_LABEL
 
 #Victory event item names, see _place_victory_event's docstring below for
 #why these are locked items rather than a can_reach_location rule.
@@ -72,6 +77,21 @@ def create_regions(world: "MCDungeonsWorld") -> None:
     goal_mission_id = world.options.goal_mission.value
     goal_mission_zone = (GOAL_MISSION_ID_TO_ZONE[goal_mission_id]
                           if goal_mission_id != GoalMission.option_none else None)
+
+    #Which DLC packs are OPTIONAL (their locations never hold progression items). Chosen per pack:
+    #  * RequiredDlcs not empty -> only the listed packs are required, every other enabled pack is optional;
+    #  * RequiredDlcs empty     -> DlcMissionsOptional decides for all packs at once (on: all optional, off: none).
+    #The pack of the Goal Mission is always required: it is the player's real win condition.
+    enabled_dlc_packs = {z.dlc_pack for z in enabled_zones if z.category == "dlc"}
+    chosen_packs = {DLC_PACK_BY_LABEL[label] for label in world.options.required_dlcs.value}
+    if chosen_packs:
+        required_packs = chosen_packs & enabled_dlc_packs
+    else:
+        required_packs = set() if dlc_missions_optional else set(enabled_dlc_packs)
+    if goal_mission_zone is not None and ZONES_BY_NAME[goal_mission_zone].category == "dlc":
+        required_packs.add(ZONES_BY_NAME[goal_mission_zone].dlc_pack)
+    optional_dlc_packs = enabled_dlc_packs - required_packs
+    world.optional_dlc_packs = sorted(optional_dlc_packs)   # read by fill_slot_data (client map colours)
     for zone in enabled_zones:
         region = Region(zone.display_name, player, multiworld)
         location_name = LOCATIONS_BY_ZONE[zone.internal_name]
@@ -88,8 +108,7 @@ def create_regions(world: "MCDungeonsWorld") -> None:
     #Exception: if the player chose this zone as their GoalMission, it's
     #their real win condition (see _place_victory_event below) - an
     #explicit goal always wins over the "optional" default.
-        if (dlc_missions_optional and zone.category == "dlc"
-                and zone.internal_name != goal_mission_zone):
+        if zone.category == "dlc" and zone.dlc_pack in optional_dlc_packs:
             for loc in region.locations:
                 if loc.name == location_name:
                     loc.progress_type = LocationProgressType.EXCLUDED
@@ -107,7 +126,7 @@ def create_regions(world: "MCDungeonsWorld") -> None:
         #fill algorithm never strands a required item behind a mission
         #that can't reliably be completed on the timeline the logic
         #assumes.
-        if zone.internal_name == "thestronghold":
+        if zone.internal_name == "thestronghold" and not world.options.eye_of_ender_checks:
             for loc in region.locations:
                 if loc.name == location_name:
                     loc.progress_type = LocationProgressType.EXCLUDED
@@ -156,6 +175,28 @@ def create_regions(world: "MCDungeonsWorld") -> None:
             name = zone_supply_chest_location_name(zone_name, n)
             zone_chest_locations[name] = ZONE_CHEST_TABLE[name]
         region.add_locations(zone_chest_locations, world.location_class)
+
+    #"Secret Zone Found" checks: only with the Secret Mission Access option on.
+    #The secret trigger lives in the secret zone's PARENT mission, so the
+    #check attaches to the parent's region (reachable exactly when you can
+    #play that mission). The secret zone itself is then unlocked by its
+    #"<Zone> Secret Access" item, no longer by finding the secret in-game.
+    #Skipped when either the parent or the secret zone itself is disabled
+    #(DLC pack off). DLC parents follow the same "optional DLC" exclusion
+    #as their Mission Complete check.
+    if world.options.secret_missions_require_secret:
+        for parent_name, secret_name in SECRET_PARENT_TO_ZONE.items():
+            parent_region = region_by_name.get(parent_name)
+            if not parent_region or secret_name not in enabled_names:
+                continue
+            found_name = SECRET_ZONE_FOUND_BY_ZONE[secret_name]
+            parent_region.add_locations({found_name: LOCATION_TABLE[found_name]}, world.location_class)
+            parent_zone = next(z for z in enabled_zones if z.internal_name == parent_name)
+            if parent_zone.category == "dlc" and parent_zone.dlc_pack in optional_dlc_packs:
+                for loc in parent_region.locations:
+                    if loc.name == found_name:
+                        loc.progress_type = LocationProgressType.EXCLUDED
+                        break
 
     #Global bonus chest locations: extra chests found across ALL
     #confirmed zones combined, beyond each zone's own baseline (see
@@ -212,9 +253,11 @@ def create_regions(world: "MCDungeonsWorld") -> None:
         entrance.access_rule = rule
 
     #Ancient Hunts: separate, no predecessor chain, gated by one item ---
+    hunt_region_by_name: Dict[str, Region] = {}
     if world.options.ancient_hunts:
         for hunt in ANCIENT_HUNT_ZONES:
             region = Region(hunt.display_name, player, multiworld)
+            hunt_region_by_name[hunt.internal_name] = region
             location_name = LOCATIONS_BY_ZONE[hunt.internal_name]
             region.add_locations({location_name: LOCATION_TABLE[location_name]}, world.location_class)
             if world.options.ancient_hunt_boss_checks:
@@ -291,8 +334,8 @@ def create_regions(world: "MCDungeonsWorld") -> None:
             continue  # that zone's DLC pack is off this generation
         loc_name = boss_kill_location_name(boss_name)
         region.add_locations({loc_name: BOSS_KILL_TABLE[loc_name]}, world.location_class)
-        if zone_internal_name == "thestronghold":
-            # Same reasoning as the Mission Complete exclusion above
+        if zone_internal_name == "thestronghold" and not world.options.eye_of_ender_checks:
+            # Same reasoning as the Mission Complete exclusion above (lifted once the Eyes are modelled)
             for loc in region.locations:
                 if loc.name == loc_name:
                     loc.progress_type = LocationProgressType.EXCLUDED
@@ -305,6 +348,59 @@ def create_regions(world: "MCDungeonsWorld") -> None:
                 if loc.name == loc_name:
                     loc.progress_type = LocationProgressType.EXCLUDED
                     break
+
+    #Mini boss kills: same idea as the boss first-kills above, one check per zone that has a mini boss,
+    #split into MiniBossKillChecks (base-game zones) and DlcMiniBossKillChecks (DLC zones). Attached to
+    #the zone's own Region, so a zone whose DLC pack is off simply has no check.
+    mini_boss_base_mode = world.options.mini_boss_kill_checks.value
+    mini_boss_dlc_mode = world.options.dlc_mini_boss_kill_checks.value
+
+    # per_zone / both: one check per zone, in the zone's own Region (always obtainable: the client forces a mini boss there)
+    for zone_internal_name in sorted(wanted_mini_boss_zones(mini_boss_base_mode, mini_boss_dlc_mode)):
+        region = region_by_name.get(zone_internal_name)
+        if not region:
+            continue  # that zone's DLC pack is off this generation
+        loc_name = mini_boss_kill_location_name(zone_internal_name)
+        region.add_locations({loc_name: MINI_BOSS_KILL_TABLE[loc_name]}, world.location_class)
+
+    # per_type / both: one check per kind of mini boss. A given kind cannot be forced to appear, so these are
+    # EXCLUDED (filler only, never a progression item), in the earliest zone that uses that kind.
+    for type_key, home_zone in wanted_mini_boss_type_homes(
+            mini_boss_base_mode, mini_boss_dlc_mode, set(region_by_name)).items():
+        region = region_by_name[home_zone]
+        type_loc_name = mini_boss_type_location_name(type_key)
+        region.add_locations({type_loc_name: MINI_BOSS_TYPE_TABLE[type_loc_name]}, world.location_class)
+        for loc in region.locations:
+            if loc.name == type_loc_name:
+                loc.progress_type = LocationProgressType.EXCLUDED
+
+    #Eye of Ender checks: one per Eye type, placed in the parent mission of its chain (the sub-missions are
+    #not zones here). The six matching "Eye of Ender" items gate The Stronghold in Rules.py.
+    if world.options.eye_of_ender_checks:
+        for eye_type, _mission, eye_zone in EYE_OF_ENDER_TYPES:
+            region = region_by_name.get(eye_zone)
+            if not region:
+                continue
+            eye_loc_name = eye_of_ender_location_name(eye_type)
+            region.add_locations({eye_loc_name: EYE_OF_ENDER_TABLE[eye_loc_name]}, world.location_class)
+
+    #Villager checks: one per captured camp merchant, placed in the mission where the villager is held. The matching
+    #merchant items are plain "useful" items (no logic depends on them).
+    if world.options.villager_checks:
+        for villager_key, _fragment, _display, villager_zone in VILLAGER_TYPES:
+            region = region_by_name.get(villager_zone) or hunt_region_by_name.get(villager_zone)
+            if not region:
+                continue
+            villager_loc_name = villager_location_name(villager_key)
+            region.add_locations({villager_loc_name: VILLAGER_TABLE[villager_loc_name]}, world.location_class)
+
+    #Optional DLC packs (see optional_dlc_packs above): now that every location of every zone exists, none of
+    #the locations of an optional pack's missions may hold a progression item - chests, boss and mini boss
+    #kills, secrets, everything. Only this pass is pack-wide; the Mission Complete exclusion above stays.
+    for zone in enabled_zones:
+        if zone.category == "dlc" and zone.dlc_pack in optional_dlc_packs:
+            for loc in region_by_name[zone.internal_name].locations:
+                loc.progress_type = LocationProgressType.EXCLUDED
 
     #Win condition: Emerald Mode (reaching your Emerald Goal) and/or
     #GoalMission (reaching a specific mission), and together when

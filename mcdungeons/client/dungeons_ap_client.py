@@ -169,6 +169,9 @@ from dungeons_reader import (
     STORE_OFFSETS,
     GAME_STORE,
     save_game_store,
+    apply_game_store,
+    load_seed_game_store,
+    save_seed_game_store,
     get_zone_name_index,
     ZONE_NAME_LOOKUP,
     ZONE_ID_ORDER,
@@ -176,6 +179,9 @@ from dungeons_reader import (
     MISSION_ACCESS_ITEM_IDS,
     ITEM_ID_TO_ZONE,
     MISSION_REQUIRES,
+    missing_zone_items,
+    secret_access_marker,
+    set_secret_access_required,
     is_zone_truly_unlocked,
     get_pawn,
     get_spawned_attributes,
@@ -204,6 +210,10 @@ from dungeons_reader import (
     get_mission_outcome_events,
     # boss kills
     get_death_events,
+    PowerfulMobTracker,
+    MapCountAnnouncer,
+    get_secret_events,
+    set_secret_block,
     resolve_boss_for_actor,
     BOSS_KILLS_FILE,
     # zone chests
@@ -225,6 +235,13 @@ from dungeons_reader import (
     ITEM_ID_TO_EMERALD_AMOUNT,
     apply_emerald_reward,
     read_current_emeralds,
+    test_unlock_any_secret_zone,
+    apply_secret_zone_unlock,
+    get_elevelname_value,
+    _pick_any_secret_zone_name,
+    pick_random_secret_zone_name,
+    _save_unlock_secret_zone_index,
+    UNLOCK_SECRET_ZONE_INDEX,
     load_applied_reward_indices,
     save_applied_reward_indices,
     APPLIED_REWARDS_FILE,
@@ -242,7 +259,21 @@ from dungeons_reader import (
     # progressive pickups
     set_pickup_tier,
 )
-from _apworld_data import Locations as _apw, Items as _apw_items
+import dungeons_reader as dungeons_reader_module   # for the module-level LAST_OWN_UNLOCK_NOTIFY timestamp
+import crash_diag   # mutation journal, process stats, safety gate, crash bundle (crash_diag.py)
+# Feature modules (one file per subject, see each module's docstring):
+from eye_of_ender import (EYE_OF_ENDER_ITEM_NAME, eye_of_ender_tick, push_eye_block,
+                         grant_pending_eyes)
+from mini_boss_checks import mini_boss_kill_tick, mini_boss_checks_active, mini_boss_zone_forced
+from chest_tools import run_chests
+import miniboss as miniboss_module   # /miniboss devtool (summon a powerful mob)
+import effects as effects_module     # /effect devtool (freeze, slowness, potions... on the player)
+import villagers as villagers_module # villager checks + /villager devtool (captured villager -> check, merchant item -> unlock)
+import dll_health                    # DLL build check at attach + /crash devtool (crash_report.py reads the DLL's crash log)
+import health_watch                  # freezes / black screen / stuck calls watchdog + /health devtool (not crashes)
+import check_audit                   # every check sent, with its cause and flags for false positives + /audit devtool
+import deathimg as deathimg_module   # custom picture instead of the skull on a DeathLink death screen
+from _apworld_data import Locations as _apw, Items as _apw_items, ZoneData as _apw_zonedata
 from apply_item_reward import (
     is_item_reward,
     apply_item_reward,
@@ -263,6 +294,7 @@ from item_lookup import items_by_category
 # sourced through _apworld_data's zip-safe loader instead of requiring a
 # full `worlds.mcdungeons` package import.
 ITEM_ID_TO_NAME = {info.code: name for name, info in _apw_items.ITEM_TABLE.items()}
+ANCIENT_HUNT_ACCESS_ITEM_NAME = "Ancient Hunt Access"  # = Items.ANCIENT_HUNT_ACCESS_ITEM
 
 # The mission every fresh save physically starts inside, before receiving
 # any items - see the level-lock-enforcement exemption in game_watcher.
@@ -377,6 +409,19 @@ def _ensure_bridge_dll_injected(pid):
 
 
 GAME_POLL_INTERVAL = 0.2       # seconds - matches the old client's tick rate
+# Devtool mapping powerful mobs, passively while you play: logs which powerful mobs (mini bosses)
+# are present / killed in each zone into dungeons_bridge_debug.log and powerful_mobs_seen.json.
+# Purely observational - it never sends a check. Set to False to switch it off.
+POWERFUL_MOB_LOGGING = True
+# Zone mini boss: when the player opens the LAST chest check of a zone (ZONE_CHEST_COUNTS) and no powerful
+# mob has been beaten in that zone this run, summon the zone's own mini boss (miniboss.ZONE_MINIBOSSES)
+# above that chest. Needs POWERFUL_MOB_LOGGING (that is what tells whether a mini boss was beaten).
+# Set to False to switch it off.
+ZONE_MINIBOSS_ENABLED = True
+# Devtool mapping chest count, at the start of every mission zone: logs the known chest count of the
+# zone, then the chest/secret total read off the in-game map (dungeons_bridge_debug.log + client log).
+# Purely observational. Set to False to switch it off.
+ZONE_START_CHEST_COUNT_LOGGING = True
 PAWN_ANNOUNCE_DEBOUNCE = 2      # consecutive identical get_pawn readings needed before the
                                # client announces a change in character presence (filters out
                                # a single transient bad read so the log doesn't flicker)
@@ -405,6 +450,7 @@ PAWN_STABILITY_ATTEMPTS = 15       # max get_pawn polls before giving up on the 
 PAWN_STABILITY_MATCHES = 3         # consecutive identical non-null pawn reads required
 PAWN_STABILITY_POLL_INTERVAL = 0.5 # seconds between polls (~7.5s worst case before giving up)
 DEATH_LINK_COOLDOWN = 10.0
+MISSION_POPUP_SPACING = 4.0   # seconds between native 'mission unlocked' popups
 
 # Separate logger/tab for "what's happening in the game right now" (zone,
 # health, attach status) so it doesn't drown out the normal Archipelago
@@ -439,6 +485,10 @@ def _give_safe_prepare(ctx):
         return (False, True, ("Refusing to grant: a zone transition/loading screen is in progress "
                                "right now. This is exactly the window where a write can silently "
                                "corrupt the inventory - will retry automatically in a few seconds.")), None, None
+    _grant_ok, _grant_why = crash_diag.mutations_allowed()
+    if not _grant_ok:
+        return (False, True, (f"Holding the grant: {_grant_why}. It stays queued and is retried "
+                               f"automatically in a few seconds.")), None, None
 
     _, pawn_error = get_pawn(pm, base)
     if pawn_error:
@@ -564,6 +614,240 @@ async def _run_give_safe(ctx, output):
         await _retry_give_safe_until_done(ctx, output)
 
 
+def _zone_run_key(ctx):
+    """Identity of the current zone visit: the powerful-mob tracker starts a new run object on every zone change
+    (hub included), so entering the same zone twice gives two different keys."""
+    tracker = getattr(ctx, "powerful_tracker", None)
+    run = getattr(tracker, "run", None) if tracker is not None else None
+    return id(run) if run is not None else None
+
+
+def _zone_mb_state(ctx, zone):
+    run_key = _zone_run_key(ctx)
+    st = getattr(ctx, "zone_mb", None)
+    if st is None or st["zone"] != zone or st["run_key"] != run_key:
+        st = ctx.zone_mb = {"zone": zone, "run_key": run_key, "chests": set(), "spawned": False, "noted": False}
+    return st
+
+
+def _zone_seed_key(ctx):
+    return f"{getattr(ctx, '_room_seed_name', None)}:{getattr(ctx, 'auth', None)}"
+
+
+async def zone_miniboss_on_chest(ctx, zone, event):
+    """Called for every opened chest (kind 'chest' or 'supply'). Remembers it as the last chest of this run (for
+    /miniboss atchest) and, when it is the last CHEST CHECK of the zone, applies the zone mini boss rule:
+      a mini boss already beaten in this zone this run?  yes -> nothing.
+      no -> summon the zone's chosen mini boss above this chest."""
+    tracker = getattr(ctx, "powerful_tracker", None)
+    run_key = _zone_run_key(ctx)
+    ctx.last_chest_event = dict(event, zone=zone, run_key=run_key)
+    if not ZONE_MINIBOSS_ENABLED or tracker is None or getattr(tracker, "run", None) is None:
+        return
+    if not mini_boss_zone_forced(ctx, zone):
+        return                              # only seeds with per_zone / both force a mini boss into the zone
+    if classify_interactable_class(event["class_name"]) != "chest":
+        return                              # supply stations are not "chest checks"
+    st = _zone_mb_state(ctx, zone)
+    if st["spawned"] or event["actor_addr"] in st["chests"]:
+        return
+    st["chests"].add(event["actor_addr"])
+    total = _apw.ZONE_CHEST_COUNTS.get(zone, (0, 0))[0]
+    alias = miniboss_module.zone_miniboss(zone, _zone_seed_key(ctx))
+    if total <= 0 or alias is None:
+        if not st["noted"]:
+            st["noted"] = True
+            why = "no chest checks are set up for this zone" if total <= 0 else "no mini boss is listed for this zone"
+            game_logger.info(f"Zone mini boss [{zone}]: {why} - nothing will be summoned here.")
+        return
+    game_logger.info(f"Zone mini boss [{zone}]: chest {len(st['chests'])}/{total}")
+    if len(st["chests"]) < total:
+        return
+    st["spawned"] = True                    # decided once per run, whatever happens next
+    killed = sorted(tracker.run.get("killed_types", ()))
+    if killed:
+        game_logger.info(f"Zone mini boss [{zone}]: last chest reached, but a mini boss was already beaten here "
+                         f"this run ({', '.join(killed)}) - nothing summoned.")
+        return
+    game_logger.info(f"Zone mini boss [{zone}]: last chest reached and no mini boss beaten yet - "
+                     f"summoning {miniboss_module.MINIBOSS_TYPES[alias][0]}.")
+    await _summon_zone_miniboss(ctx, alias, ctx.last_chest_event)
+
+
+async def _summon_zone_miniboss(ctx, alias, chest_event):
+    if not ctx.pm or not ctx.base:
+        game_logger.info("Zone mini boss: not attached to Dungeons.exe.")
+        return
+    chest_event = dict(chest_event or {}, fallback_player=True)
+    try:
+        async with ctx.bridge_pipe_lock:
+            lines = await asyncio.to_thread(miniboss_module.run_miniboss, ctx.pm, ctx.base, "atchest", alias, "",
+                                            game_logger.info, chest_event)
+    except Exception as e:
+        game_logger.info(f"Zone mini boss: error talking to the game ({type(e).__name__}: {e}).")
+        return
+    for line in lines:
+        game_logger.info(line)
+
+
+async def _zone_miniboss_command(ctx, output, option):
+    """/miniboss zone [now]: the zone's mini boss and where this run stands; 'now' summons it right away above
+    the last chest (test the placement without opening every chest)."""
+    zone = ctx.game_state.get("zone")
+    if not zone or zone == "hub":
+        output("Zone mini boss: you are not in a mission zone.")
+        return
+    seed_key = _zone_seed_key(ctx)
+    pool = miniboss_module.ZONE_MINIBOSSES.get(zone, [])
+    alias = miniboss_module.zone_miniboss(zone, seed_key)
+    total = _apw.ZONE_CHEST_COUNTS.get(zone, (0, 0))[0]
+    st = _zone_mb_state(ctx, zone)
+    tracker = getattr(ctx, "powerful_tracker", None)
+    killed = sorted(tracker.run.get("killed_types", ())) if tracker is not None and tracker.run else []
+    output(f"Zone mini boss [{zone}]: chosen = {alias or 'none listed'} (pool: {', '.join(pool) or 'empty'}); "
+           f"chest checks known = {total or 'none'}; opened this run = {len(st['chests'])}/{total}; "
+           f"beaten this run = {', '.join(killed) or 'no'}; summoned this run = {'yes' if st['spawned'] else 'no'}; "
+           f"trigger {'ON' if ZONE_MINIBOSS_ENABLED else 'OFF'}.")
+    if miniboss_module.normalize(option) == "now":
+        if not alias:
+            output("Zone mini boss: nothing is listed for this zone.")
+            return
+        st["spawned"] = True
+        await _summon_zone_miniboss(ctx, alias, getattr(ctx, "last_chest_event", None))
+
+
+async def _run_miniboss(ctx, output, name, extra, extra2):
+    """Body of the /miniboss devtool (runs as its own task - the command handler itself is
+    synchronous). Holds ctx.bridge_pipe_lock for the whole run because the bridge pipe is
+    single-instance and miniboss.py makes several round trips; the work itself goes through
+    asyncio.to_thread so the event loop (AP connection, chest polling) is never blocked."""
+    if not ctx.pm or not ctx.base:
+        output("Not attached to Dungeons.exe yet.")
+        return
+    if miniboss_module.normalize(name) == "zone":
+        await _zone_miniboss_command(ctx, output, extra)
+        return
+    chest_event = getattr(ctx, "last_chest_event", None)
+    if chest_event and chest_event.get("run_key") != _zone_run_key(ctx):
+        chest_event = None                  # recorded in an earlier zone visit: its address means nothing now
+    try:
+        async with ctx.bridge_pipe_lock:
+            lines = await asyncio.to_thread(miniboss_module.run_miniboss, ctx.pm, ctx.base, name, extra, extra2, output,
+                                            chest_event)
+    except Exception as e:
+        output(f"miniboss hit an error talking to the game ({type(e).__name__}: {e}).")
+        return
+    for line in lines:
+        output(line)
+
+
+async def _run_effect(ctx, output, name, extra, extra2):
+    """Body of the /effect devtool: same pattern as _run_miniboss (own task, bridge pipe lock held,
+    the blocking work goes through asyncio.to_thread so the event loop is never blocked)."""
+    if not ctx.pm or not ctx.base:
+        output("Not attached to Dungeons.exe yet.")
+        return
+    try:
+        async with ctx.bridge_pipe_lock:
+            lines = await asyncio.to_thread(effects_module.run_effect, ctx.pm, ctx.base, name, extra, extra2, output)
+    except Exception as e:
+        output(f"effect hit an error talking to the game ({type(e).__name__}: {e}).")
+        return
+    for line in lines:
+        output(line)
+
+
+async def _run_crash(ctx, output, sub):
+    """Body of the /crash devtool. Reading the crash log needs no game; the live parts go through the bridge pipe."""
+    try:
+        if ctx.pm and sub.strip().lower() in ("crumbs", "build", "test"):
+            async with ctx.bridge_pipe_lock:
+                lines = await asyncio.to_thread(dll_health.run_crash, ctx.pm, sub)
+        elif sub.strip().lower() in ("", "help", "?"):
+            lines = await asyncio.to_thread(dll_health.run_crash, ctx.pm, sub)
+        else:
+            lines = ["Unknown /crash command - type /crash help."]
+        if not ctx.pm and sub.strip().lower() in ("crumbs", "build", "test"):
+            lines = ["Not attached to Dungeons.exe yet."]
+    except Exception as e:
+        lines = [f"crash hit an error ({type(e).__name__}: {e})."]
+    for line in lines:
+        output(line)
+
+
+async def _run_villager(ctx, output, name, extra):
+    """Body of the /villager devtool: own task, bridge pipe lock held, blocking work in a worker thread."""
+    if not ctx.pm or not ctx.base:
+        output("Not attached to Dungeons.exe yet.")
+        return
+    try:
+        async with ctx.bridge_pipe_lock:
+            lines = await asyncio.to_thread(villagers_module.run_villager, ctx, ctx.pm, ctx.base, name, extra, output)
+    except Exception as e:
+        output(f"villager hit an error talking to the game ({type(e).__name__}: {e}).")
+        return
+    for line in lines:
+        output(line)
+
+
+async def _run_death_image(ctx, output=None, custom_path=None, attempts=6):
+    """Puts the custom picture on the death screen's skull. Runs as its own task: the pipe lock is
+    held only for the game calls, the work itself goes through asyncio.to_thread. Retries a few times
+    (the widget may not exist yet right after a level change); never raises."""
+    say = output or game_logger.info
+    last_error = None
+    for attempt in range(attempts):
+        if not ctx.pm or not ctx.base:
+            return
+        try:
+            async with ctx.bridge_pipe_lock:
+                line = await asyncio.to_thread(deathimg_module.apply, ctx.pm, ctx.base, custom_path)
+            say(f"Death screen: {line}")
+            return
+        except Exception as e:
+            last_error = e
+            await asyncio.sleep(1.0)
+    say(f"Death screen picture not applied ({type(last_error).__name__}: {last_error}).")
+
+
+async def _run_deathimg_info(ctx, output):
+    if not ctx.pm or not ctx.base:
+        output("Not attached to Dungeons.exe yet.")
+        return
+    try:
+        async with ctx.bridge_pipe_lock:
+            lines = await asyncio.to_thread(deathimg_module.info, ctx.pm, ctx.base)
+    except Exception as e:
+        output(f"deathimg info failed ({type(e).__name__}: {e}).")
+        return
+    for line in lines:
+        output(line)
+
+
+async def _run_chest_icon(ctx, output, custom_path=None):
+    if not ctx.pm or not ctx.base:
+        output("Not attached to Dungeons.exe yet.")
+        return
+    try:
+        async with ctx.bridge_pipe_lock:
+            line = await asyncio.to_thread(deathimg_module.apply_map_chest_icon, ctx.pm, ctx.base, custom_path)
+        output(f"Map: {line}")
+    except Exception as e:
+        output(f"Map chest icon not applied ({type(e).__name__}: {e}).")
+
+
+async def _run_menu_logo(ctx, output, custom_path=None):
+    if not ctx.pm or not ctx.base:
+        output("Not attached to Dungeons.exe yet.")
+        return
+    try:
+        async with ctx.bridge_pipe_lock:
+            line = await asyncio.to_thread(deathimg_module.apply_menu_logo, ctx.pm, ctx.base, custom_path)
+        output(f"Menu: {line}")
+    except Exception as e:
+        output(f"Menu logo not applied ({type(e).__name__}: {e}).")
+
+
 class MCDungeonsCommandProcessor(ClientCommandProcessor):
     # Commands here still work exactly normally when typed (dispatch is by
     # name via getattr(self, f"_cmd_{name}"), untouched by this) - they're
@@ -633,18 +917,57 @@ class MCDungeonsCommandProcessor(ClientCommandProcessor):
                         "Set it back to 'hard' (the default) if you are not sure.")
         self.output(f"Void mode: {resp}" if ok else f"Void mode request failed: {resp}")
 
+    def _cmd_guard(self, mode: str = ""):
+        """Devtool - show / switch the DLL crash guard (on|off). Off = the game really crashes at the first fault."""
+        if not isinstance(self.ctx, MCDungeonsContext) or getattr(self.ctx, "pm", None) is None:
+            self.output("Not attached to the game yet.")
+            return
+        mode = mode.strip().lower()
+        if mode not in ("", "on", "off"):
+            self.output("Usage: /guard [on|off]   (no argument = show the current state)")
+            return
+        if mode:
+            ok, resp = dungeons_reader_module.bridge_set_crash_guard(self.ctx.pm, mode)
+            if not ok:
+                self.output(f"Crash guard request failed: {resp}")
+                return
+            if mode == "off":
+                self.output("Crash guard OFF (diagnostic): the game will now really crash at the first bad read, which "
+                            "gives a full Unreal crash report with the exact call stack. Turn it back on with /guard on.")
+        stats = dungeons_reader_module.bridge_crash_guard_stats(self.ctx.pm)
+        if stats is None:
+            self.output("Crash guard state unavailable (old DLL?).")
+        else:
+            self.output(f"Crash guard: {'ON' if stats['enabled'] else 'OFF'}, {stats['sites']} patched site(s), "
+                        f"{stats['hits']} null read(s) recovered so far.")
+
     def _cmd_set_store(self, channel: str = ""):
-        """devtool set store (steam/minecraft_launcher/microsoft_store)"""
+        """set the game store for THIS seed (steam/minecraft_launcher/microsoft_store)"""
+        seed_dir = getattr(self.ctx, "seed_dir", None)
         if not channel:
-            self.output(f"Usage: /set_store <{'|'.join(STORE_OFFSETS)}>")
-            self.output(f"Currently set to: '{GAME_STORE}' (takes effect on next launch)")
+            self.output(f"Usage: /set_store <{'|'.join(STORE_OFFSETS)}>  (saved per seed)")
+            self.output(f"Currently in use: '{dungeons_reader_module.GAME_STORE}'")
+            if seed_dir:
+                saved = load_seed_game_store(seed_dir)
+                self.output(f"Saved for this seed with /set_store: {saved or 'nothing (the YAML option is used)'}")
             return
         if channel not in STORE_OFFSETS:
             self.output(f"Unknown store '{channel}' - must be one of {list(STORE_OFFSETS)}")
             return
-        save_game_store(channel)
-        self.output(f"Store set to '{channel}'. Restart the client (and the game/DLL) "
-                     f"for it to take effect.")
+        if not seed_dir:
+            self.output("Connect to your slot first: the store is saved per seed.")
+            return
+        save_seed_game_store(seed_dir, channel)
+        if getattr(self.ctx, "pm", None):
+            if channel != dungeons_reader_module.GAME_STORE:
+                self.output(f"Store set to '{channel}' for this seed. The game is already attached with "
+                             f"'{dungeons_reader_module.GAME_STORE}': restart the client (and the game/DLL) "
+                             "for it to take effect.")
+            else:
+                self.output(f"Store set to '{channel}' for this seed.")
+        else:
+            apply_game_store(channel)
+            self.output(f"Store set to '{channel}' for this seed and applied now.")
         if channel != "steam":
             self.output("NOTE: this channel's offsets are still UNCONFIRMED placeholders "
                          "copied from steam - a fresh Dumper-7 dump for this build is "
@@ -674,14 +997,153 @@ class MCDungeonsCommandProcessor(ClientCommandProcessor):
         self.output("give_safe: working on it...")
         async_start(_run_give_safe(ctx, self.output), name="GiveSafe")
 
+    def _cmd_img(self, kind: str = "", *rest: str):
+        """Devtool reload image and make it so you can change the path for the img"""
+        if not isinstance(self.ctx, MCDungeonsContext):
+            return
+        ctx = self.ctx
+        kind = (kind or "").strip().lower()
+        arg = " ".join(rest).strip().strip('"')          # a path may contain spaces
+        low = arg.lower()
+        if kind in ("death", "deathimg") and low in ("on", "off", "info"):
+            if low == "info":
+                async_start(_run_deathimg_info(ctx, self.output), name="DeathImgInfo")
+            else:
+                ctx.deathimg_enabled = (low == "on")
+                self.output("Death screen picture: ON (applied after each received DeathLink)." if low == "on" else
+                            "Death screen picture: OFF (a death screen already changed stays until the level changes).")
+        elif kind in ("death", "deathimg"):
+            if arg:
+                ctx.deathimg_path = arg
+                self.output(f"Death screen picture file: {arg}")
+            async_start(_run_death_image(ctx, self.output, ctx.deathimg_path, attempts=1), name="DeathImgReload")
+        elif kind in ("chest", "chesticon", "icon"):
+            async_start(_run_chest_icon(ctx, self.output, arg or None), name="ChestIcon")
+        elif kind in ("logo", "logoimg"):
+            async_start(_run_menu_logo(ctx, self.output, arg or None), name="MenuLogo")
+        elif kind == "all":
+            async_start(_run_death_image(ctx, self.output, ctx.deathimg_path, attempts=1), name="DeathImgReload")
+            async_start(_run_chest_icon(ctx, self.output, None), name="ChestIcon")
+            async_start(_run_menu_logo(ctx, self.output, None), name="MenuLogo")
+        else:
+            state = "ON" if ctx.deathimg_enabled else "OFF"
+            self.output("/img death [file]  reload the death screen picture (optionally from another file); "
+                        f"currently {state}, also: /img death on | off | info")
+            self.output("/img chest [file]  reload the chest icon of the in-game map (open the map in a mission first)")
+            self.output("/img logo [file]   reload the game logo of the main menu (run it while the main menu is on screen)")
+            self.output("/img all           reload the three with their default files")
+
+    def _cmd_miniboss(self, name: str = "", extra: str = "", extra2: str = ""):
+        """Devtool try to summon a mini boss"""
+        if not isinstance(self.ctx, MCDungeonsContext):
+            return
+        async_start(_run_miniboss(self.ctx, self.output, name, extra, extra2), name="Miniboss")
+
+    def _cmd_health(self):
+        """Detect freeze, black screen or if the game is stuck (this command only shows the process since it's always active)"""
+        if not isinstance(self.ctx, MCDungeonsContext):
+            return
+        for line in health_watch.status_lines(self.ctx):
+            self.output(line)
+
+    def _cmd_audit(self, what: str = ""):
+        """List the last 15 checks and the reason why they were sent"""
+        if not isinstance(self.ctx, MCDungeonsContext):
+            return
+        for line in check_audit.audit_lines(self.ctx, only_flagged=what.strip().lower() in ("flagged", "suspects", "bad")):
+            self.output(line)
+
+    def _cmd_crash(self, sub: str = ""):
+        """Give the latest calls before the crash to find a culprit"""
+        if not isinstance(self.ctx, MCDungeonsContext):
+            return
+        async_start(_run_crash(self.ctx, self.output, sub), name="Crash")
+
+    def _cmd_effect(self, name: str = "", extra: str = "", extra2: str = ""):
+        """Devtool not implemented yet wait for v0.0.4"""
+        if not isinstance(self.ctx, MCDungeonsContext):
+            return
+        self.output("/effect is not implemented yet, wait for v0.0.4.")
+
+
+SWEEP_PROBE_VALUE = 0xFF                 # not a real ELevelNames value: the real IsMissionCompleted says False
+SWEEP_NEVER_FIRE_ZONES = {"obsidianpinnacle"}   # the goal mission is only ever sent from a live completion
+
+UNCONFIRMED_CHESTS_FILE = "dlc_chest_counts_seen.json"   # in the seed's progress folder
+
+
+def _note_unconfirmed_chest(ctx, zone_name, kind, class_name):
+    """A chest/supply chest was opened in a zone that has no chest checks set up (not in
+    ZONE_CHEST_COUNTS - typically a DLC zone whose chests are still to be measured). It is NOT sent
+    as a check; instead keep a tally to measure the mission: the count of this run, and the highest
+    count ever seen per zone (dlc_chest_counts_seen.json, chests reset on every run of a mission).
+    After clearing a whole mission, the logged numbers go into Locations.DLC_ZONE_CHEST_COUNTS."""
+    if not zone_name or zone_name == "hub":
+        return
+    run = getattr(ctx, "unconfirmed_chest_run", None)
+    if not run or run.get("zone") != zone_name:
+        run = ctx.unconfirmed_chest_run = {"zone": zone_name, "chest": 0, "supply": 0}
+    run["supply" if kind == "supply" else "chest"] += 1
+    seen = {}
+    try:
+        with open(UNCONFIRMED_CHESTS_FILE, encoding="utf-8") as f:
+            seen = json.load(f)
+    except (OSError, ValueError):
+        pass
+    best = seen.setdefault(zone_name, {"chest": 0, "supply": 0})
+    best["chest"] = max(best.get("chest", 0), run["chest"])
+    best["supply"] = max(best.get("supply", 0), run["supply"])
+    try:
+        with open(UNCONFIRMED_CHESTS_FILE, "w", encoding="utf-8") as f:
+            json.dump(seen, f, indent=2, sort_keys=True)
+    except OSError as e:
+        game_logger.info(f"Could not save {UNCONFIRMED_CHESTS_FILE}: {e}")
+    game_logger.info(
+        f"Chest tally for '{zone_name}' (no chest checks set up yet, nothing sent): this run "
+        f"{run['chest']} chest(s) + {run['supply']} supply chest(s); most seen {best['chest']} + "
+        f"{best['supply']}. After clearing the whole mission, add \"{zone_name}\": "
+        f"({best['chest']}, {best['supply']}) to DLC_ZONE_CHEST_COUNTS in Locations.py "
+        f"[{class_name}].")
+
+
+def _own_world_version() -> str:
+    """Version of the apworld this client is running from (archipelago.json at the
+    apworld root; read zip-aware like map_tab does). "unknown" if unreadable."""
+    try:
+        import json as _json
+        from pathlib import Path as _Path
+        manifest_path = _Path(__file__).resolve().parents[1] / "archipelago.json"
+        try:
+            raw = __loader__.get_data(str(manifest_path))   # inside a .apworld
+        except Exception:
+            raw = manifest_path.read_bytes()                # unpacked folder
+        return str(_json.loads(raw)["world_version"])
+    except Exception:
+        return "unknown"
+
 
 class MCDungeonsContext(CommonContext):
     game = "Minecraft Dungeons"
     items_handling = 0b111  # everything: other players' sends, our own echoed back, starting inventory
     command_processor = MCDungeonsCommandProcessor
 
+    async def check_locations(self, locations):
+        """Every check goes through here: the audit records who asked for it and flags what looks off (check_audit.py)."""
+        check_audit.record(self, locations)
+        sent = await super().check_locations(locations)
+        # CommonContext.send_msgs() silently drops everything while the server connection is down,
+        # and a boss kill / chest event only fires once in game - so a check made during a server
+        # outage was lost for good (the player had to redo the mission). Remember what we sent in
+        # ctx.locations_checked: the base client re-sends that whole set on every (re)connect, and
+        # the server ignores duplicates.
+        if sent:
+            self.locations_checked.update(sent)
+        return sent
+
     def __init__(self, server_address, password):
         super().__init__(server_address, password)
+        crash_diag.EXTRA_SUMMARY[:] = [lambda: ["HEALTH EVENTS (newest last):"] + (health_watch.recent_events(self, 25) or ["  none"]),
+                                       lambda: ["SUSPICIOUS CHECKS:"] + (check_audit.suspects(self) or ["  none"])]
 
         # memory attach state - filled in by game_watcher once Dungeons.exe is found
         self.pm = None
@@ -754,6 +1216,8 @@ class MCDungeonsContext(CommonContext):
         self.lock_kill_count = 0
         self.lock_kill_next_at = 0.0
         self.deathlink_kill_retry_until = 0.0
+        self.deathimg_enabled = True              # custom picture on the death screen of a DeathLink death
+        self.deathimg_path = None                 # None = archipelago_death.png next to the client
         # set when a mission-outcome trigger fires and we're waiting on the
         # one-shot IsMissionCompleted() confirm call to resolve it; cleared
         # on a definitive True/False, and reset to None the moment a NEW
@@ -811,6 +1275,10 @@ class MCDungeonsContext(CommonContext):
         self.pawn_candidate_count = 0
         self.progressive_pickups_unlocked = False  # set once per attach, see game_watcher
         self.pending_emerald_grants = []  # [(absolute_index, amount), ...] - not yet applied
+        self.pending_eye_grants = []      # [(absolute_index, 1), ...] "Eye of Ender" items not yet given in-game
+        self.pending_villager_grants = [] # [(absolute_index, item name), ...] camp merchant items not yet unlocked in-game
+        self.pending_mission_popups = []  # [zone_name, ...] - native "zone unlocked" popups not shown yet
+        self.last_mission_popup_time = 0.0
                                            # in-game (not attached yet, or the write failed);
                                            # retried every tick in game_watcher until it lands.
         self.pending_item_grants = []  # [(absolute_index, item_name), ...] - same idea, for
@@ -929,7 +1397,38 @@ class MCDungeonsContext(CommonContext):
         else:
             game_logger.info("dungeons_bridge.dll confirmed injected (or already was) on connect.")
 
+    def _maybe_mark_bug(self, args: dict):
+        """A player typing exactly "bug" in the Archipelago chat marks a black screen / glitch while it happens:
+        log it with the client timestamp and ask the DLL to dump its flight recorder (the last ProcessEvent
+        calls) so the moment can be matched with dungeons_bridge_debug.log. Only this slot's own chat counts."""
+        if args.get("type") != "Chat":
+            return
+        if args.get("slot") != getattr(self, "slot", None):
+            return
+        if str(args.get("message", "")).strip().lower() != "bug":
+            return
+        game_logger.info("BUG MARKER: chat message 'bug' received - asking the DLL to dump its flight recorder.")
+        async_start(self._bug_marker_dump())
+
+    async def _bug_marker_dump(self):
+        pm = self.pm
+        if pm is None:
+            game_logger.info("BUG MARKER: game not attached - nothing to dump.")
+            return
+        try:
+            ok, resp = await asyncio.to_thread(dungeons_reader_module.bridge_dump_recorder, pm)
+        except Exception as e:
+            game_logger.info(f"BUG MARKER: recorder dump request failed: {e}")
+            return
+        game_logger.info(f"BUG MARKER: recorder dump {'done' if ok else 'FAILED'} ({resp}). "
+                         f"See the FLIGHT RECORDER lines in dungeons_bridge_debug.log.")
+
     def _on_package(self, cmd: str, args: dict):
+        if cmd == "PrintJSON":
+            try:
+                self._maybe_mark_bug(args)
+            except Exception as e:
+                game_logger.info(f"bug marker error (continuing): {e}")
         if cmd == "RoomInfo":
             # CommonContext.seed_name is ONLY ever READ by the base class
             # (process_server_cmd's RoomInfo handler uses it purely to
@@ -950,6 +1449,21 @@ class MCDungeonsContext(CommonContext):
             # (death_link, boss/emerald/pickup toggles) reads from here.
             self.slot_data = args.get("slot_data", {}) or {}
 
+            # With secret_missions_require_secret ON, the level lock also needs each secret zone's
+            # Secret Access item (a missing one kills the player on entry, like any locked zone).
+            set_secret_access_required(self.slot_data.get("secret_missions_require_secret", False))
+
+            # Warn when the seed was generated with another apworld version than this client
+            # (a mismatch can mean different logic / options / item tables).
+            _seed_version = self.slot_data.get("world_version")
+            _client_version = _own_world_version()
+            if _seed_version and _client_version != "unknown" and str(_seed_version) != _client_version:
+                _mismatch_msg = (f"WARNING: this seed was generated with Minecraft Dungeons apworld "
+                                 f"v{_seed_version} but this client is v{_client_version}. Install the "
+                                 f"matching .apworld to avoid logic or item mismatches.")
+                logging.getLogger("Client").warning(_mismatch_msg)
+                game_logger.info(_mismatch_msg)
+
             # Per-run progress (unlocked_zones, claimed boss kills/chests
             # /milestones, applied rewards, mission-complete baseline,
             # cumulative emerald-earned total) persists in DATA_DIR
@@ -967,6 +1481,30 @@ class MCDungeonsContext(CommonContext):
             # any particular seed.
             seed_key = f"{getattr(self, '_room_seed_name', None)}:{self.auth}"
             self._reset_progress_if_new_seed(seed_key)
+
+            # Game store, PER SEED. Priority: this seed's /set_store
+            # (seed_dir/game_store.json) > the YAML's game_store option > the global
+            # default setting. Applied to the session only if the game isn't attached yet.
+            _seed_store = load_seed_game_store(self.seed_dir)
+            _yaml_store = self.slot_data.get("game_store")
+            if _seed_store:
+                _wanted, _source = _seed_store, "/set_store (this seed)"
+            elif _yaml_store in STORE_OFFSETS:
+                _wanted, _source = _yaml_store, "YAML option game_store"
+            else:
+                _wanted, _source = None, None
+            if _wanted:
+                if getattr(self, "pm", None):
+                    if _wanted != dungeons_reader_module.GAME_STORE:
+                        game_logger.info(f"Game store '{_wanted}' ({_source}) differs from the store already "
+                                         f"in use ('{dungeons_reader_module.GAME_STORE}') and the game is "
+                                         "attached: restart the client and the game to apply it.")
+                else:
+                    try:
+                        if apply_game_store(_wanted):
+                            game_logger.info(f"Game store set to '{_wanted}' from {_source}.")
+                    except ValueError as _e:
+                        game_logger.info(f"Ignoring game store '{_wanted}': {_e}")
 
             # STARTING_ZONE (Squid Coast) is a precollected/starting item
             # at generation time now (see __init__.py's generate_early) -
@@ -989,6 +1527,10 @@ class MCDungeonsContext(CommonContext):
             game_logger.info(
                 f"Connected. Boss kill checks: base={'on' if self.slot_data.get('boss_kill_checks') else 'off'}, "
                 f"dlc={'on' if self.slot_data.get('dlc_boss_kill_checks') else 'off'}. "
+                f"Eye of Ender checks: {'on' if self.slot_data.get('eye_of_ender_checks') else 'off'}. "
+                f"Villager checks: {'on' if self.slot_data.get('villager_checks') else 'off'}. "
+                f"Mini boss kill checks (0 none, 1 per_type, 2 per_zone, 3 both): base={self.slot_data.get('mini_boss_kill_checks', 0)}, "
+                f"dlc={self.slot_data.get('dlc_mini_boss_kill_checks', 0)}. "
                 f"Emerald goal: {self.slot_data.get('emerald_goal', 'none')}."
             )
 
@@ -1051,11 +1593,26 @@ class MCDungeonsContext(CommonContext):
             # a check earning something back (or another player's send
             # arriving) is what causes a ReceivedItems packet at all.
             for offset, item in enumerate(args.get("items", [])):
+                # A Secret Access item is recorded in the persisted unlocked set (like an Access
+                # item) so the level lock can require it when the option is on.
+                _sa_name = ITEM_ID_TO_NAME.get(item.item)
+                if _sa_name and _sa_name.endswith(" Secret Access"):
+                    _sa_zone = next((z.internal_name for z in _apw_zonedata.ZONES
+                                     if z.secret and z.display_name == _sa_name[:-len(" Secret Access")]), None)
+                    if _sa_zone and secret_access_marker(_sa_zone) not in self.unlocked_zones:
+                        self.unlocked_zones.add(secret_access_marker(_sa_zone))
+                        # With the option on, the Secret Access is the zone's ONLY unlock item: it
+                        # also stands for the zone's Access (children, /unlocked, ...).
+                        if (getattr(self, "slot_data", None) or {}).get("secret_missions_require_secret"):
+                            self.unlocked_zones.add(_sa_zone)
+                        _save_unlocked_zones(self.unlocked_zones)
                 zone_name = ITEM_ID_TO_ZONE.get(item.item)
+                newly_unlocked_zone = False
                 if zone_name and zone_name not in self.unlocked_zones:
                     self.unlocked_zones.add(zone_name)
                     _save_unlocked_zones(self.unlocked_zones)
                     game_logger.info(f"Unlocked: {zone_name}")
+                    newly_unlocked_zone = True
 
                 # Emerald filler items ("100/300/500 Emeralds") grant
                 # straight into the player's currency total instead of
@@ -1073,9 +1630,74 @@ class MCDungeonsContext(CommonContext):
                 item_name = ITEM_ID_TO_NAME.get(item.item)
                 absolute_index = args.get("index", 0) + offset
 
+                # Notification in the client's main tab for every mission
+                # item received (normal zone access, Secret Access, Ancient
+                # Hunt access). Normal zones: only when the zone was newly
+                # unlocked just above, so a reconnect (which resends the
+                # whole backlog from index 0) or a restart never repeats it.
+                # Secret / Ancient Hunt items have no unlocked_zones entry,
+                # so they're deduped by absolute index in
+                # applied_reward_indices instead (persisted, per-seed).
+                mission_label = None
+                if newly_unlocked_zone:
+                    zinfo = _apw_zonedata.ZONES_BY_NAME.get(zone_name)
+                    mission_label = f"Mission unlocked: {zinfo.display_name if zinfo else zone_name}"
+                elif item_name and absolute_index not in self.applied_reward_indices:
+                    if item_name.endswith(" Secret Access"):
+                        # Option OFF = old system: secret missions are items in the
+                        # table but never handed out, and if one somehow arrives
+                        # anyway (console/start inventory) nothing happens at all.
+                        if not getattr(self, "slot_data", {}).get("secret_missions_require_secret"):
+                            continue
+                        mission_label = (f"Secret mission unlocked: "
+                                         f"{item_name[:-len(' Secret Access')]}")
+                    elif item_name == ANCIENT_HUNT_ACCESS_ITEM_NAME:
+                        mission_label = "Ancient Hunts unlocked"
+                    if mission_label:
+                        self.applied_reward_indices.add(absolute_index)
+                        save_applied_reward_indices(self.applied_reward_indices)
+                if mission_label:
+                    logging.getLogger("Client").info(mission_label)
+                    game_logger.info(mission_label)
+                    # Also queue the game's own native "mission unlocked"
+                    # popup (ClientUnlockBonusMission - image + sound, popup
+                    # only, no state change). Shown from game_watcher once a
+                    # character is on screen, one at a time.
+                    popup_zone = zone_name if newly_unlocked_zone else None
+                    is_secret_item = bool(item_name and item_name.endswith(" Secret Access"))
+                    if popup_zone is None and is_secret_item:
+                        base_display = item_name[:-len(" Secret Access")]
+                        popup_zone = next((z.internal_name for z in _apw_zonedata.ZONES
+                                           if z.secret and z.display_name == base_display), None)
+                    if popup_zone and get_elevelname_value(popup_zone) is not None:
+                        # "Secret Access" items only exist when the world option
+                        # secret_missions_require_secret is ON. In that mode the
+                        # item REALLY unlocks the secret mission in-game
+                        # (UnlockBonusMission) + shows the native popup. With the
+                        # option off, no such item exists and everything else keeps
+                        # the old behaviour (popup only, no state change).
+                        full_unlock = (is_secret_item and bool(
+                            getattr(self, "slot_data", {}).get("secret_missions_require_secret")))
+                        self.pending_mission_popups.append((popup_zone, full_unlock))
+                    elif popup_zone or item_name == ANCIENT_HUNT_ACCESS_ITEM_NAME:
+                        game_logger.info(f"No native popup for {popup_zone or item_name}: "
+                                         f"no ELevelNames value known (text message only).")
+
                 if emerald_amount:
                     if absolute_index not in self.applied_reward_indices:
                         self.pending_emerald_grants.append((absolute_index, emerald_amount))
+                elif item_name == EYE_OF_ENDER_ITEM_NAME:
+                    # An "Eye of Ender" received from the multiworld = one real Eye in the wallet (the real
+                    # Eyes the mini bosses drop are checks now and not picked up, see the eye_of_ender_checks
+                    # option). Same queue + dedup-by-absolute-index scheme as the emerald grants above.
+                    if absolute_index not in self.applied_reward_indices:
+                        self.pending_eye_grants.append((absolute_index, 1))
+                elif item_name in villagers_module.VILLAGER_ITEM_NAMES:
+                    # A camp merchant received from the multiworld = that merchant unlocked in the camp (the villager
+                    # itself is a check now, see the villager_checks option and villagers.py). Same queue +
+                    # dedup-by-absolute-index scheme as the Eye of Ender grants above.
+                    if absolute_index not in self.applied_reward_indices:
+                        self.pending_villager_grants.append((absolute_index, item_name))
                 elif item_name == PROGRESSIVE_ENCHANT_SLOT_ITEM:
                     # Counting IS the entire action for this one - nothing
                     # to grant in-game, just tracked so later equipment
@@ -1155,6 +1777,7 @@ class MCDungeonsContext(CommonContext):
         safe_key = re.sub(r"[^A-Za-z0-9_.-]+", "_", seed_key or "unknown").strip("_") or "unknown"
         seed_dir = DATA_DIR / "seeds" / safe_key
         seed_dir.mkdir(parents=True, exist_ok=True)
+        self.seed_dir = seed_dir   # used by /set_store (per-seed setting)
 
         is_new_seed_dir = not any(seed_dir.iterdir())
         game_logger.info(f"Seed check: current={seed_key!r} -> switching to "
@@ -1206,7 +1829,10 @@ class MCDungeonsContext(CommonContext):
 
         # Always-fresh, per-connection state - never persisted, so
         # nothing to load either way above.
+        self.pending_mission_popups = []
         self.pending_emerald_grants = []
+        self.pending_eye_grants = []
+        self.pending_villager_grants = []
         self.pending_item_grants = []
         self.next_item_grant_attempt_time = 0
         self.progressive_pickup_tier_applied = None
@@ -1238,6 +1864,8 @@ class MCDungeonsContext(CommonContext):
             success, kill_error, diag = kill_local_player(self.pm, self.base)
             if success:
                 game_logger.info(f"{source} died (chain={diag.get('chain')}).")
+                if self.deathimg_enabled:
+                    async_start(_run_death_image(self, None, self.deathimg_path), name="DeathImage")
             else:
                 self.deathlink_kill_retry_until = time.time() + 20.0
                 game_logger.info(f"{source} died - could not kill local player yet: {kill_error} (will retry).")
@@ -1388,6 +2016,13 @@ async def apply_saved_void_mode(ctx):
 LOCK_KILL_WINDOW_S = 120.0        # total time the lock keeps enforcing (was 60 s, single kill)
 LOCK_KILL_RESPAWN_WAIT_S = 4.0    # pause after a kill so the respawn can complete
 LOCK_KILL_MAX_KILLS = 10          # hard cap - more than any lives count
+# Level gate: the DLL refuses locked missions at the camp (TryStartMissionSelection / TryContinueMission) so the
+# player never enters them. The kill-based enforcement below stays as a fallback for anything the gate misses.
+LEVEL_GATE_ENABLED = True
+PROCESS_STATS_INTERVAL = 15.0   # seconds between process/guard samples (crash_diag.periodic)
+# Unmapped boss candidates (SDK EntityType ids): only LOGGED when they die, never claimed as a boss kill.
+# Vengeful Heart of Ender still has no confirmed EntityType (see BOSS_ENTITY_TYPE_IDS: 10/12 bosses).
+BOSS_CANDIDATE_ENTITY_TYPES = {2893: "PerfectFormHeart (Vengeful Heart of Ender?)"}
 
 async def fire_mission_complete(ctx: MCDungeonsContext, zone_name: str):
     """Sends this zone's Mission Complete check - "already sent" is
@@ -1398,6 +2033,70 @@ async def fire_mission_complete(ctx: MCDungeonsContext, zone_name: str):
         return
     game_logger.info(f"Mission complete: {zone_name}")
     await ctx.check_locations([location_id])
+
+
+async def fire_secret_zone_found(ctx: MCDungeonsContext, zone_name):
+    """A SecretFound event fired while the player was in `zone_name`. That
+    zone is the secret zone's parent mission, so it maps to exactly one
+    "Secret Zone Found" check (Locations.SECRET_PARENT_TO_ZONE). Several events
+    for the same secret (SecretFound + ExecuteSecretFound) collapse into one
+    check because "already sent" is read from ctx.checked_locations."""
+    secret_zone = _apw.SECRET_PARENT_TO_ZONE.get(zone_name)
+    if not secret_zone:
+        game_logger.info(f"SecretFound event in '{zone_name}' - not a known secret parent zone, ignored.")
+        return
+    location_id = _apw.SECRET_ZONE_FOUND_TABLE[_apw.SECRET_ZONE_FOUND_BY_ZONE[secret_zone]]
+    if location_id in ctx.checked_locations:
+        game_logger.info(f"Secret zone found in {zone_name} (-> {secret_zone}) - check already sent.")
+        return
+    game_logger.info(f"Secret zone found in {zone_name} (-> {secret_zone}) - sending check.")
+    await ctx.check_locations([location_id])
+
+
+async def powerful_mob_tick(ctx, pm, base, death_events):
+    """One step of the passive powerful-mob logging (see POWERFUL_MOB_LOGGING). Threaded and
+    under the bridge pipe lock like the other pipe users; any failure is logged (throttled)
+    and swallowed so this can never break the game watcher."""
+    try:
+        tracker = getattr(ctx, "powerful_tracker", None)
+        if tracker is None:
+            tracker = ctx.powerful_tracker = PowerfulMobTracker(say=game_logger.info)
+        async with ctx.bridge_pipe_lock:
+            await asyncio.to_thread(tracker.tick, pm, base, death_events)
+    except Exception as e:
+        if time.time() - getattr(ctx, "last_powerful_error_log", 0.0) >= 30.0:
+            ctx.last_powerful_error_log = time.time()
+            game_logger.info(f"powerful mob logging failed: {e}")
+
+
+async def _map_count_attempt(ctx, announcer, pm, base):
+    """Reading part of the zone-start chest announcement (the level's MapStatActor counters), run as a
+    background task so the game loop never waits on it."""
+    try:
+        async with ctx.bridge_pipe_lock:        # resolving class names goes over the bridge pipe
+            await asyncio.to_thread(announcer.attempt, pm, base)
+    except Exception as e:
+        if time.time() - getattr(ctx, "last_map_count_error_log", 0.0) >= 30.0:
+            ctx.last_map_count_error_log = time.time()
+            game_logger.info(f"zone-start chest count failed: {e}")
+    finally:
+        announcer.busy = False
+
+
+def zone_start_chest_count_tick(ctx, pm, base):
+    """Cheap per-tick part: detects the zone start (logs the known count) and, when a map read
+    is due, launches it in the background (one at a time)."""
+    try:
+        announcer = getattr(ctx, "map_count_announcer", None)
+        if announcer is None:
+            announcer = ctx.map_count_announcer = MapCountAnnouncer(say=game_logger.info)
+        if announcer.check_zone(pm, base) and not announcer.busy:
+            announcer.busy = True
+            asyncio.create_task(_map_count_attempt(ctx, announcer, pm, base), name="ZoneStartChestCount")
+    except Exception as e:
+        if time.time() - getattr(ctx, "last_map_count_error_log", 0.0) >= 30.0:
+            ctx.last_map_count_error_log = time.time()
+            game_logger.info(f"zone-start chest count failed: {e}")
 
 
 async def fire_boss_kill(ctx: MCDungeonsContext, boss_name: str):
@@ -1794,7 +2493,14 @@ async def game_watcher(ctx: MCDungeonsContext):
         # zone/mission tracking) instead of assuming the new process
         # already matches what the old one had going into its death.
         ctx.progressive_pickups_unlocked = False
+        ctx.villager_block_applied = None      # a fresh game/DLL has blocking off again: push it again (villagers.py)
         ctx.progressive_pickup_tier_applied = None
+        ctx.secret_block_applied = None   # fresh DLL/process: re-push the SecretFound block
+        ctx.dll_build_announced = False   # fresh DLL/process: log which build it is once
+        ctx.level_gate_applied = None     # fresh DLL/process: re-push the level gate
+        ctx.level_gate_retry_at = 0.0
+        crash_diag.set_state_provider(lambda: {"zone": ctx.game_state.get("zone"), "loading": ctx.currently_loading,
+                                               "pawn": ctx.pawn_present})
         ctx.current_zone_index = "__unset__"
         ctx.currently_loading = False
         ctx.pending_mission_outcome_zone = None
@@ -1870,12 +2576,34 @@ async def game_watcher(ctx: MCDungeonsContext):
                               "still be caught live as they happen).")
         elif IS_MISSION_COMPLETED_INDEX is not None:
             game_logger.info("Checking existing mission completion state...")
-            for zone_name in MISSION_LOCATION_IDS:
-                if zone_name in ctx.known_mission_completed:
-                    continue
-                # Threaded - same missing-read-timeout risk as the other
-                # pipe calls fixed elsewhere in this file.
-                if await asyncio.to_thread(call_is_mission_completed, pm, base, zone_name) is True:
+            # The sweep is only trusted if the function behind IS_MISSION_COMPLETED_INDEX behaves like
+            # IsMissionCompleted. That index points into an unordered list of candidate functions, so
+            # it can land on another function that answers True for everything - which used to mark
+            # every mission complete and even send the goal. Two checks, nothing is sent before both pass:
+            #  1) an impossible level value must answer False;
+            #  2) the answers must not be True for (nearly) every zone.
+            probe = await asyncio.to_thread(call_is_mission_completed, pm, base, "creeperwoods",
+                                            None, SWEEP_PROBE_VALUE)
+            sweep = {}
+            if probe is False:
+                for zone_name in MISSION_LOCATION_IDS:
+                    if zone_name in ctx.known_mission_completed or zone_name in SWEEP_NEVER_FIRE_ZONES:
+                        continue
+                    # Threaded - same missing-read-timeout risk as the other
+                    # pipe calls fixed elsewhere in this file.
+                    sweep[zone_name] = await asyncio.to_thread(call_is_mission_completed, pm, base, zone_name)
+            answered = [z for z, v in sweep.items() if v is not None]
+            done = [z for z in answered if sweep[z] is True]
+            if probe is not False:
+                game_logger.info(f"Mission catch-up sweep skipped: the sanity probe answered {probe!r} "
+                                 f"(expected False), so IsMissionCompleted could not be checked reliably "
+                                 f"right now. Completions are still caught live.")
+            elif len(answered) >= 10 and len(done) >= 0.9 * len(answered):
+                game_logger.info(f"Mission catch-up sweep DISCARDED: it reported {len(done)} of "
+                                 f"{len(answered)} missions as complete, which looks like the wrong game "
+                                 f"function answering. Nothing was sent. Completions are still caught live.")
+            else:
+                for zone_name in done:
                     ctx.known_mission_completed.add(zone_name)
                     await fire_mission_complete(ctx, zone_name)
 
@@ -1938,6 +2666,7 @@ async def game_watcher(ctx: MCDungeonsContext):
             import auto_inject
             if not auto_inject.is_process_alive(pm.process_id):
                 game_logger.info(f"{_game_process_name()} is no longer running - waiting for it to relaunch...")
+                crash_diag.on_game_gone(pm.process_id)
                 try:
                     pm.close_process()   # an open handle keeps the dead process listed
                 except Exception:
@@ -1982,22 +2711,103 @@ async def game_watcher(ctx: MCDungeonsContext):
                     if ok:
                         ctx.progressive_pickup_tier_applied = ctx.progressive_pickup_tier
 
+                await push_eye_block(ctx, pm)   # Eye of Ender checks: the real Eye must not be picked up too (eye_of_ender.py)
+                await villagers_module.push_villager_block(ctx, pm)   # Villager checks: freed villagers must not unlock the merchant too (villagers.py)
+                if not getattr(ctx, "dll_build_announced", False):   # once per attach: which DLL build, and is it current (dll_health.py)
+                    ctx.dll_build_announced = True
+                    async with ctx.bridge_pipe_lock:
+                        for line in await asyncio.to_thread(dll_health.announce, pm):
+                            game_logger.info(line)
+
+                # --- Secret Mission Access: "Secret Zone Found" check ---
+                # With the option on, the in-game secret trigger (lever, hidden
+                # wall...) must NOT reveal the secret mission any more: the DLL
+                # swallows SecretFound and we send the zone's "Secret Zone Found"
+                # check instead (the mission itself comes from its Secret
+                # Access item). The trigger sits in the secret zone's PARENT
+                # mission, so the current zone tells us which check it is.
+                if bool(ctx.slot_data.get("secret_missions_require_secret", False)):
+                    # Blocking is best-effort: an OLD dungeons_bridge.dll (not rebuilt
+                    # from the current .cpp) can't block, but it DOES queue SecretFound
+                    # events, so detection must never depend on blocking succeeding.
+                    # Without blocking the game still unlocks the mission itself,
+                    # but the "Secret Zone Found" check is sent either way.
+                    want_level = getattr(ctx, "secret_block_level", 0)
+                    if want_level == 0 and getattr(ctx, "secret_block_applied", None) is None:
+                        pass   # default: no blocking at all - hidden chests etc. must keep working
+                    elif getattr(ctx, "secret_block_applied", None) != want_level:
+                        async with ctx.bridge_pipe_lock:
+                            ok, block_error = await asyncio.to_thread(set_secret_block, pm, want_level)
+                        if ok:
+                            ctx.secret_block_applied = want_level
+                            game_logger.info(f"SecretFound blocking level {want_level} ON (secret missions now come from "
+                                              "items; finding the secret sends a check).")
+                        elif not getattr(ctx, "secret_block_warned", False):
+                            ctx.secret_block_warned = True
+                            game_logger.info(f"Could not enable SecretFound blocking ({block_error}) - rebuild "
+                                              "dungeons_bridge.dll from the current .cpp. Secret finds are still "
+                                              "detected and sent as checks, but the game will also unlock the mission.")
+                    async with ctx.bridge_pipe_lock:
+                        secret_events = await asyncio.to_thread(get_secret_events, pm) or []
+                    # Only ShowSecretMissionUnlocked counts: plain SecretFound also fires
+                    # for hidden chests etc. And ignore the popup that OUR OWN
+                    # ClientUnlockBonusMission (Secret Access item / test commands) causes.
+                    own_recently = (time.time() - dungeons_reader_module.LAST_OWN_UNLOCK_NOTIFY) < 6.0
+                    found_popup = [e for e in secret_events if e[2] == "ShowSecretMissionUnlocked"]
+                    if found_popup and not own_recently:
+                        zone_for_secret = ctx.game_state.get("zone")
+                        if zone_for_secret not in _apw.SECRET_PARENT_TO_ZONE:
+                            zone_for_secret = ctx.last_mission_zone   # popup shown back in the hub
+                        await fire_secret_zone_found(ctx, zone_for_secret)
+                    elif secret_events and ctx.debug_interact_logging:
+                        game_logger.info(f"{len(secret_events)} secret event(s) ignored "
+                                          f"({'own popup' if own_recently else 'not a mission unlock'}).")
+                elif getattr(ctx, "secret_block_applied", None) not in (None, 0):
+                    # Connected to a seed WITHOUT the option after one with it:
+                    # the DLL is still blocking - switch the base-game behaviour back on.
+                    async with ctx.bridge_pipe_lock:
+                        ok, _block_error = await asyncio.to_thread(set_secret_block, pm, 0)
+                    if ok:
+                        ctx.secret_block_applied = None
+                        game_logger.info("SecretFound blocking OFF (option disabled for this seed).")
+
                 death_link_enabled = bool(ctx.slot_data.get("death_link", True))
                 watch_boss_kills_enabled = bool(ctx.slot_data.get("boss_kill_checks", False)) or \
                     bool(ctx.slot_data.get("dlc_boss_kill_checks", False))
+                watch_mini_boss_enabled = mini_boss_checks_active(ctx)   # option: none / per_type / per_zone / both
 
                 # --- boss kills (dungeons_bridge.dll OnCharacterDeath events) ---
-                if watch_boss_kills_enabled:
+                death_events = []
+                if watch_boss_kills_enabled or watch_mini_boss_enabled or POWERFUL_MOB_LOGGING:
                     # Threaded - same reasoning as get_chest_open_events below:
                     # runs every tick, unthreaded it's a live risk of freezing
                     # the whole client (and its connection to the AP server)
                     # on a stuck pipe read.
                     async with ctx.bridge_pipe_lock:
                         death_events = await asyncio.to_thread(get_death_events, pm) or []
-                    for addr in death_events:
-                        boss_name = resolve_boss_for_actor(pm, addr)
-                        if boss_name:
-                            await fire_boss_kill(ctx, boss_name)
+                    for _cand_addr in death_events:
+                        try:
+                            _cand_type = dungeons_reader_module.get_actor_entity_type(pm, _cand_addr)
+                        except Exception:
+                            _cand_type = None
+                        if _cand_type in BOSS_CANDIDATE_ENTITY_TYPES:
+                            game_logger.info(f"BOSS CANDIDATE DIED: {BOSS_CANDIDATE_ENTITY_TYPES[_cand_type]} "
+                                             f"(EntityType {_cand_type}) in zone {ctx.game_state.get('zone')}")
+                    if watch_boss_kills_enabled:
+                        for addr in death_events:
+                            boss_name = resolve_boss_for_actor(pm, addr)
+                            if boss_name:
+                                await fire_boss_kill(ctx, boss_name)
+                if POWERFUL_MOB_LOGGING or watch_mini_boss_enabled:
+                    await powerful_mob_tick(ctx, pm, base, death_events)
+                if watch_mini_boss_enabled:
+                    await mini_boss_kill_tick(ctx)
+                if ctx.slot_data.get("eye_of_ender_checks", False):
+                    eye_of_ender_tick(ctx, pm, base)
+                if ctx.slot_data.get("villager_checks", False):
+                    await villagers_module.villager_tick(ctx, pm)
+                if ZONE_START_CHEST_COUNT_LOGGING:
+                    zone_start_chest_count_tick(ctx, pm, base)
 
                 # zone chest events are drained here but attributed to a zone
                 # below, once this tick's current zone is actually known.
@@ -2068,9 +2878,20 @@ async def game_watcher(ctx: MCDungeonsContext):
                     # off of", which is the camp/hub.
                     zone_name = ZONE_NAME_LOOKUP.get(zone_index, f"unknown_zone_{zone_index}") if zone_index is not None else "hub"
                     ctx.game_state["zone"] = zone_name
+                    crash_diag.note_level_change(zone_name)
                     game_logger.info(f"Entered zone: {zone_name}")
-                    if zone_name in ZONE_ID_ORDER:
-                        ctx.last_mission_zone = zone_name
+                    ctx.unconfirmed_chest_run = None   # a new run of a mission starts a new chest tally
+                    if zone_name in ZONE_ID_ORDER or zone_name.startswith("unknown_zone_"):
+                        # A mission whose zone index isn't in zone_name_lookup.json (an unnamed DLC
+                        # zone) must NOT inherit the previous mission: its completion and rewards
+                        # would be credited to whatever zone was played before (e.g. Creepy Crypt).
+                        # Unknown zone -> no zone at all, so nothing is attributed until it is named.
+                        ctx.last_mission_zone = zone_name if zone_name in ZONE_ID_ORDER else None
+                        if ctx.last_mission_zone is None:
+                            game_logger.info(
+                                f"WARNING: {zone_name} is not in zone_name_lookup.json - this mission's "
+                                f"completion and chests will not be credited to any zone. Add its index "
+                                f"to client/data_seeds/zone_name_lookup.json.")
                         ctx.last_locked_zone_warned = None
                         ctx.pending_lock_kill_zone = None
                         # New mission attempt starting. Anything still queued in
@@ -2162,10 +2983,12 @@ async def game_watcher(ctx: MCDungeonsContext):
 
                         if event_zone_name in ZONE_CHEST_COUNTS:
                             await fire_chest_open(ctx, event_zone_name, kind)
-                        elif ctx.debug_interact_logging:
-                            game_logger.info(f"{kind.capitalize()} interact ({event['class_name']}) resolved to "
-                                              f"zone {event_zone_name!r}, which isn't in ZONE_CHEST_COUNTS - "
-                                              f"not counted as a check.")
+                        else:
+                            _note_unconfirmed_chest(ctx, event_zone_name, kind, event["class_name"])
+                        try:
+                            await zone_miniboss_on_chest(ctx, event_zone_name, event)
+                        except Exception as e:      # never let the mini boss rule break chest handling
+                            game_logger.info(f"Zone mini boss: failed ({type(e).__name__}: {e})")
 
                 # --- level lock enforcement (full predecessor chain) ---
                 # Squid Coast is exempt: it's the game's actual mandatory
@@ -2185,8 +3008,9 @@ async def game_watcher(ctx: MCDungeonsContext):
                 if (zone_name != STARTING_ZONE and zone_name in MISSION_ACCESS_ITEM_IDS
                         and not is_zone_truly_unlocked(zone_name, ctx.unlocked_zones)):
                     if ctx.last_locked_zone_warned != zone_name:
-                        missing = [z for z in [zone_name] + MISSION_REQUIRES.get(zone_name, [])
-                                   if not is_zone_truly_unlocked(z, ctx.unlocked_zones)]
+                        missing = (missing_zone_items(zone_name, ctx.unlocked_zones)
+                                   or [z for z in [zone_name] + MISSION_REQUIRES.get(zone_name, [])
+                                       if not is_zone_truly_unlocked(z, ctx.unlocked_zones)])
                         game_logger.info(f"Locked mission '{zone_name}' - missing: {missing}")
                         ctx.last_locked_zone_warned = zone_name
                         ctx.pending_lock_kill_zone = zone_name
@@ -2225,6 +3049,8 @@ async def game_watcher(ctx: MCDungeonsContext):
                         if dl_ok:
                             ctx.deathlink_kill_retry_until = 0.0
                             game_logger.info("Delayed DeathLink kill applied.")
+                            if ctx.deathimg_enabled:
+                                async_start(_run_death_image(ctx, None, ctx.deathimg_path), name="DeathImage")
 
                 # --- mission completion: event-driven, not polled -----------
                 # The DLL trigger (MulticastMissionFinished / OnShowMissionVictory
@@ -2458,7 +3284,7 @@ async def game_watcher(ctx: MCDungeonsContext):
                 # (re-reading the balance a few seconds later to catch a
                 # zone-load reverting a raw memory write) is gone
                 # entirely now - there's nothing left for it to catch.
-                if ctx.pending_emerald_grants and not ctx.pawn_present:
+                if ctx.pending_emerald_grants and not ctx.pawn_present and crash_diag.safe_to_mutate():
                     # Confirmed root cause of a permanent earned/actual gap: get_wallet_
                     # component()'s own get_pawn() call is a single unstabilized read. In
                     # the window before the player has actually picked their character
@@ -2495,6 +3321,41 @@ async def game_watcher(ctx: MCDungeonsContext):
                             still_pending.append((absolute_index, amount))
                     ctx.pending_emerald_grants = still_pending
 
+                if ctx.pending_eye_grants and ctx.pawn_present and crash_diag.safe_to_mutate():   # "Eye of Ender" items -> real Eyes (eye_of_ender.py)
+                    await grant_pending_eyes(ctx, pm, base, save_applied_reward_indices)
+
+                if ctx.pending_villager_grants and ctx.pawn_present and crash_diag.safe_to_mutate():   # camp merchant items -> merchant unlocked (villagers.py)
+                    await villagers_module.grant_pending_villagers(ctx, pm, base, save_applied_reward_indices)
+
+                # Native "mission unlocked" popups queued by ReceivedItems.
+                # Same debounced pawn_present gate as the grants above, and
+                # spaced out so several items arriving at once (backlog on
+                # connect) don't stack their popups on top of each other.
+                if (ctx.pending_mission_popups and ctx.pawn_present
+                        and not getattr(ctx, "currently_loading", False)
+                        and time.time() - ctx.last_mission_popup_time >= MISSION_POPUP_SPACING):
+                    popup_zone, full_unlock = ctx.pending_mission_popups[0]
+                    # full_unlock: UnlockBonusMission (state) + popup.
+                    # otherwise:   popup only (notify_only=True).
+                    state_ok, notify_ok = await asyncio.to_thread(
+                        apply_secret_zone_unlock, pm, base, popup_zone,
+                        True, not full_unlock, game_logger.info)
+                    if full_unlock and not state_ok:
+                        notify_ok = False   # state change failed -> retry the whole thing
+                    if notify_ok:
+                        ctx.pending_mission_popups.pop(0)
+                        ctx.last_mission_popup_time = time.time()
+                        game_logger.info(f"Native unlock popup shown for {popup_zone}"
+                                         f"{' (zone really unlocked)' if full_unlock else ''}.")
+                        ctx.mission_popup_fails = 0
+                    else:
+                        ctx.last_mission_popup_time = time.time()  # retry after the spacing delay
+                        ctx.mission_popup_fails = getattr(ctx, "mission_popup_fails", 0) + 1
+                        if ctx.mission_popup_fails >= 5:   # give up on this one, never block the queue
+                            ctx.pending_mission_popups.pop(0)
+                            ctx.mission_popup_fails = 0
+                            game_logger.info(f"Native unlock for {popup_zone} failed 5 times - dropped.")
+
                 # --- pending equipment/location item grants - one at a time,
                 # off-thread (see _apply_next_pending_item_grant's docstring).
                 # Also gated on currently_loading: wait_for_stable_item_stash's
@@ -2511,6 +3372,39 @@ async def game_watcher(ctx: MCDungeonsContext):
                 # tick once loading finishes - nothing is lost or skipped. ---
                 if ctx.pending_item_grants and not ctx.currently_loading:
                     await _apply_next_pending_item_grant(ctx, pm, base)
+
+                # --- process stats + crash-guard storm detection (every ~15 s, see crash_diag.py) ---
+                if time.time() >= getattr(ctx, "diag_next_at", 0.0):
+                    ctx.diag_next_at = time.time() + PROCESS_STATS_INTERVAL
+                    try:
+                        async with ctx.bridge_pipe_lock:
+                            _guard_stats = await asyncio.to_thread(dungeons_reader_module.bridge_crash_guard_stats, pm)
+                        await asyncio.to_thread(crash_diag.periodic, pm.process_id, (_guard_stats or {}).get("hits"))
+                        await health_watch.health_tick(ctx, pm)   # freezes, stuck calls, black screen (not crashes)
+                    except Exception as _diag_exc:
+                        game_logger.info(f"diagnostics sample failed (continuing): {_diag_exc}")
+
+                # --- level gate: tell the DLL which missions to refuse at the camp (only when the set changes) ---
+                if LEVEL_GATE_ENABLED and time.time() >= getattr(ctx, "level_gate_retry_at", 0.0):
+                    try:
+                        _gate_ids = dungeons_reader_module.level_gate_locked_ids(ctx.unlocked_zones)
+                        _gate_key = tuple(_gate_ids)
+                        if getattr(ctx, "level_gate_applied", None) != _gate_key:
+                            async with ctx.bridge_pipe_lock:
+                                _gate_ok, _gate_err = await asyncio.to_thread(
+                                    dungeons_reader_module.set_level_gate, pm, 1, _gate_ids)
+                            if _gate_ok:
+                                ctx.level_gate_applied = _gate_key
+                                game_logger.info(f"Level gate: {len(_gate_key)} level id(s) refused at the camp.")
+                            else:
+                                ctx.level_gate_retry_at = time.time() + 30.0
+                                if not getattr(ctx, "level_gate_warned", False):
+                                    ctx.level_gate_warned = True
+                                    game_logger.info(f"Level gate not applied ({_gate_err}) - rebuild dungeons_bridge.dll from "
+                                                     f"the current .cpp. The kill fallback still enforces the locks.")
+                    except Exception as _gate_exc:
+                        ctx.level_gate_retry_at = time.time() + 30.0
+                        game_logger.info(f"Level gate sync error (continuing): {_gate_exc}")
 
                 # --- emerald milestones (throttled) ---
                 if ctx.slot_data.get("emerald_goal") and time.time() - ctx.last_emerald_poll >= EMERALD_POLL_INTERVAL:

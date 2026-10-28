@@ -102,6 +102,38 @@ Practically:
   for mission-complete and emerald milestones.
 - Boss-kill watching turns on if **either** `boss_kill_checks` or the
   newer `dlc_boss_kill_checks` slot_data flag is on.
+- Eye of Ender checks (`eye_of_ender_checks`): the client scans the level every ~3 s for Eye of Ender objects
+  (`AEyeOfEnderInstance`, type @0x4E8 = EEyeOfEnderType 1..6) and sends the check of each type it sees.
+- Crash diagnosis (`crash_report.py`, `dll_health.py`, `finish_build.py`): the DLL writes `dungeons_bridge_crash.log`
+  (every serious exception nobody patched: faulting module+offset, registers, stack walk, whether it happened inside
+  one of OUR protected game calls and which, and the last breadcrumbs of what the DLL was doing). `/crash` prints the
+  newest report with the likely culprit and resolves `dungeons_bridge.dll+0x...` to function names when the build's
+  `.map` file is next to the DLL: build with the linker option /MAP and run `python finish_build.py` after every build
+  (it saves the map under the build id). `/crash crumbs` = what the DLL is doing now, `/crash build` = DLL build and
+  features vs this client (also logged at every attach), `/crash test` = harmless proof that the reporter works. The
+  crash bundle (`crash_bundles/`) now starts with `SUMMARY.txt`. Works offline too: `python crash_report.py`.
+- Health watch, for problems that are NOT crashes (`health_watch.py`, `check_audit.py`, DLL section "Health watch"):
+  the DLL's watchdog notices when the game thread stops running ProcessEvent (a freeze) and writes a HANG REPORT into
+  `dungeons_bridge_crash.log` (the game thread's stack plus the top frame and name of EVERY thread, so a render/driver
+  stall can be told from our code), reports one of our own game calls that is stuck (OWNCALL_STUCK) or slow (SLOW_CALL),
+  and a level load that never ends. The client adds Windows' "not responding" test, a black-screen and a frozen-picture
+  check on the game window (only while the game logic runs, never during a loading screen; needs Pillow), and warns when
+  a blocking feature keeps swallowing calls. `/health` = live numbers + recent events; the first serious alert saves a
+  crash bundle while the game is still frozen. `/audit` lists every check sent with who asked for it and flags for the
+  false-positive shapes (burst, just after a level change, no player, during a load, repeat): `check_audit.log`.
+  Both feed SUMMARY.txt in the crash bundles.
+- Villager checks (`villager_checks`): freeing a captured villager sends the check "Rescue the <Merchant>" and the camp
+  merchant arrives as an item instead (`villagers.py`). The DLL reports every merchant unlock the game starts
+  (`get_merchant_events`) and swallows those of the five captured camp merchants (`set_block_merchants 1 <fragments>`);
+  a received merchant item calls `UMerchantsUtil::UnlockMerchantForAllLocalPlayers` through CALLDATA, which the DLL lets
+  through because it is one of our own calls. Needs the dungeons_bridge.dll rebuilt from the matching .cpp. Devtool:
+  `/villager` (list / events / unlock <name> / block on|off).
+- Mini boss checks: `mini_boss_kill_checks` (base-game zones) and `dlc_mini_boss_kill_checks` (DLC zones) are
+  Choices, slot_data values 0 none / 1 per_type / 2 per_zone / 3 both (see `mini_boss_checks.py`).
+  per_zone = one "<Zone> - Mini Boss Kill" per zone in `MINIBOSS_ZONES`, and a mini boss is FORCED into every such
+  zone (the zone mini boss rule only runs in seeds with per_zone / both); per_type = one "Mini Boss - <Type>" per
+  kind in `MINIBOSS_TYPE_ORDER` (EXCLUDED locations: filler only). Both are sent from the powerful-mob tracker's
+  kills (the tracker is then run even if `POWERFUL_MOB_LOGGING` is off).
 - Emerald milestone sending respects the `emerald_checks` /
   `emerald_is_goal` split: if `emerald_checks` is off, only the single
   top milestone is ever sent (and only if `emerald_is_goal` is on),
@@ -121,3 +153,37 @@ delete it.
 primitive game trainers, overlays, and mod loaders use. Some Defender
 configurations flag this heuristically - add an exclusion for this
 folder if it gets blocked.
+
+## Code layout (one module per subject)
+
+Newer features each live in ONE client module, imported by `dungeons_ap_client.py`; the apworld side of the same
+feature stays in `Items.py` / `Locations.py` / `Options.py` / `Regions.py` / `Rules.py` / `__init__.py`.
+
+| Subject | Client module | DLL part (`dungeons_bridge.cpp`) |
+|---|---|---|
+| Eye of Ender checks (detection, pickup blocking, giving the Eyes received as items) | `eye_of_ender.py` | section "Eye of Ender pickup blocking" |
+| Mini boss kill checks (one per zone) | `mini_boss_checks.py` | - |
+| `/chests` (counts, live counters, chest actors scan) | `chest_tools.py` | - |
+| `/miniboss` Devtool and the zone mini boss rule | `miniboss.py` | - |
+| Villager checks (captured villager -> check, merchant item -> unlock) and `/villager` | `villagers.py` | section "Merchant unlock" |
+| `/effect` Devtool (freeze, slowness, potions on the player) | `effects.py` | - |
+
+`dungeons_reader.py` keeps the shared game-reading primitives (memory, pipe, level scans, wallet) these modules import.
+The level is scanned once and shared (`scan_full_zone_shared`) by the powerful-mob tracker, the Eye scan and `/chests`.
+
+## Black screen / lost local player (flight recorder)
+
+Some 12-16 minutes into a level the game can lose its local player: the client logs `Character ABSENT: No local
+players`, the screen goes black and the DLL log fills with `CRASH GUARD: recovered ... at image + 0xb9ebbb` (the game
+reads a NULL player controller ~10x per second; the guard keeps it from crashing). To find out WHY the player
+disappears, `dungeons_bridge.dll` keeps the last 16384 ProcessEvent calls and, at the first guard hit of an episode,
+writes `FLIGHT RECORDER:` lines to `dungeons_bridge_debug.log`: the number of calls, every call to a function that can
+remove a local player (RemovePlayer, HandleControllerConnectionChange, HandleLocalPlayerLeave, OnUserSignedOut...), the
+12 busiest functions and the last 80 calls with their time before the freeze. `dump_recorder` over the pipe dumps the
+live ring on demand. Needs the DLL rebuilt from this `dungeons_bridge.cpp`.
+
+The crash guard is rule based (`kGuardRules` in `dungeons_bridge.cpp`): each rule is a byte pattern for one known
+"null object" crash site of the game, armed at start-up (`CRASH GUARD: armed at ... (rule N: ...)` in the DLL log) and
+only acting on a READ of the exact member offset with the exact register at NULL. Rule 0: the tick reading
+`GetPlayerController(..,0)->member @0x3C8`. Rule 1 (UE4Minidump of 2026-10-14, access violation reading 0x30 in
+`Dungeons.exe+0x2362846`): a method called with `this == NULL` loading `this->member @0x30` before its own null check.

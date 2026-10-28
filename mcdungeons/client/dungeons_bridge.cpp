@@ -28,9 +28,13 @@
 //        /link d3d11.lib dxgi.lib <minhook>\build\libMinHook.x64.lib ^
 //        /OUT:dungeons_bridge.dll
 //
+// Add /MAP:dungeons_bridge.map to the link options (before /OUT) and run `python finish_build.py` after every build:
+// the map lets /crash turn dungeons_bridge.dll+0x... into function names (crash reports AND freeze reports).
+//
 // Both from "x64 Native Tools Command Prompt for VS 2022".
 
 #include <windows.h>
+#include <tlhelp32.h>
 #include <d3d11.h>
 #include <dxgi.h>
 #include <string>
@@ -49,6 +53,8 @@
 #include <sstream>
 #include <functional>
 #include <atomic>
+#include <cstdarg>
+#include <cstring>
 
 #include "MinHook.h"
 
@@ -189,6 +195,101 @@ static void LogLine(const std::string& line)
 static uintptr_t GetImageBase()
 {
     return reinterpret_cast<uintptr_t>(GetModuleHandle(0));
+}
+
+// ---- Build identity + breadcrumbs (crash reporting, early part) ---------------------------------------------------
+// kBuildMarker is searched for in the DLL FILE by the tools (tools/finish_build.py, crash_diag.py) to tell which build
+// a crash report or a .map file belongs to. kFeatures is what the client checks at attach time (get_build_info), so
+// an old DLL next to a newer client is reported immediately instead of failing in a confusing way.
+static const char kBuildMarker[] = "DBBUILD:" __DATE__ " " __TIME__;
+static const char* const kBuildId = kBuildMarker + 8;
+static const char kFeatures[] = "merchants,crashreport,owncall,crumbs,health";
+
+// Breadcrumbs: a small lock-free ring of "what the DLL itself was doing" (pipe commands, our own game calls,
+// merchant events, hook state changes...). Allocation-free so it can be written - and read by the crash reporter -
+// from any thread, even inside an exception handler. Torn entries are possible and harmless.
+struct Crumb { ULONGLONG tick; DWORD tid; char kind[12]; char text[76]; uint64_t a; uint64_t b; };
+static const uint32_t CRUMB_SIZE = 256;   // power of two
+static Crumb g_crumbs[CRUMB_SIZE];
+static std::atomic<uint32_t> g_crumbHead{ 0 };
+
+static void CrumbAdd(const char* kind, const char* text, uint64_t a = 0, uint64_t b = 0)
+{
+    Crumb& c = g_crumbs[g_crumbHead.fetch_add(1, std::memory_order_relaxed) & (CRUMB_SIZE - 1)];
+    c.tick = GetTickCount64();
+    c.tid = GetCurrentThreadId();
+    strncpy_s(c.kind, sizeof(c.kind), kind ? kind : "", _TRUNCATE);
+    strncpy_s(c.text, sizeof(c.text), text ? text : "", _TRUNCATE);
+    c.a = a;
+    c.b = b;
+}
+
+static std::atomic<DWORD> g_hookThreadId{ 0 };          // thread that runs hkProcessEvent (the game thread)
+static std::atomic<uint64_t> g_curCallObj{ 0 };         // our own CALLDATA call in progress (0 = none)
+static std::atomic<uint64_t> g_curCallFunc{ 0 };
+static std::atomic<uint64_t> g_lastFaultAddr{ 0 };      // address of the last fault caught by one of OUR __try blocks
+static void DescribeAddress(uint64_t addr, char* out, size_t n);   // "module+0xRVA", defined with the crash reporter
+
+// ---- Health watch (freezes, slow calls, false positives): shared state -------------------------------------------
+// Everything that is not a crash but still ruins a session. The watchdog (HealthSample, run by the VoidController
+// thread) turns it into events the client drains with get_health_events; live numbers come from get_health.
+struct HealthEvent { ULONGLONG tick; char kind[16]; char text[140]; uint64_t value; };
+static std::mutex g_healthMutex;
+static std::vector<HealthEvent> g_healthEvents;
+static void HealthEventAdd(const char* kind, const char* text, uint64_t value = 0)   // normal context only (locks, may allocate)
+{
+    CrumbAdd("HEALTH", kind, value);
+    HealthEvent e;
+    memset(&e, 0, sizeof(e));
+    e.tick = GetTickCount64();
+    strncpy_s(e.kind, sizeof(e.kind), kind ? kind : "", _TRUNCATE);
+    strncpy_s(e.text, sizeof(e.text), text ? text : "", _TRUNCATE);
+    e.value = value;
+    std::lock_guard<std::mutex> lock(g_healthMutex);
+    if (g_healthEvents.size() < 64)
+        g_healthEvents.push_back(e);
+}
+// How many game calls each blocking feature swallowed (a false positive shows as a count that keeps climbing).
+static std::atomic<uint32_t> g_blockedPickup{ 0 };
+static std::atomic<uint32_t> g_blockedEye{ 0 };
+static std::atomic<uint32_t> g_blockedSecret{ 0 };
+static std::atomic<uint32_t> g_blockedMerchant{ 0 };
+// Our own game calls: how long the current one has been running, how many were slow.
+static std::atomic<ULONGLONG> g_curCallStartMs{ 0 };
+static char g_curCallName[72];
+static std::atomic<uint32_t> g_slowCalls{ 0 };
+static std::atomic<uint32_t> g_maxCallMs{ 0 };
+static std::atomic<bool> g_stalled{ false };
+static std::atomic<ULONGLONG> g_lastPeChangeMs{ 0 };
+static void WriteHangSample(DWORD gameTid, ULONGLONG idleMs, bool foreground, int sampleNo);   // defined with the freeze watchdog
+static bool GameWindowIsForeground();
+
+// Own function because MSVC refuses __try in a function that has C++ objects needing unwinding (HandleRequest has).
+static void CrashSelfTestFault()
+{
+    __try
+    {
+        *reinterpret_cast<volatile int*>(0x10) = 1;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+    }
+}
+
+// The last `maxEntries` breadcrumbs, oldest first, one per line: "+<ms ago> tid=<n> KIND text a=0x.. b=0x..".
+static std::string CrumbsToString(uint32_t maxEntries)
+{
+    const uint32_t head = g_crumbHead.load(std::memory_order_relaxed);
+    const uint32_t count = std::min<uint32_t>(std::min<uint32_t>(head, CRUMB_SIZE), maxEntries);
+    const ULONGLONG now = GetTickCount64();
+    std::ostringstream out;
+    for (uint32_t k = 0; k < count; ++k)
+    {
+        const Crumb& c = g_crumbs[(head - count + k) & (CRUMB_SIZE - 1)];
+        out << "+" << (now >= c.tick ? now - c.tick : 0) << "ms tid=" << c.tid << " " << c.kind << " " << c.text
+            << " a=0x" << std::hex << c.a << " b=0x" << c.b << std::dec << "\n";
+    }
+    return out.str();
 }
 
 struct StoreOffsets
@@ -509,11 +610,79 @@ static std::atomic<uint32_t>  g_voidCalls{ 0 };          // safety-net counter f
 // Crash guard state (the guard itself is defined further down, see "Crash guard").
 static const int GUARD_MAX_SITES = 16;
 static std::atomic<uintptr_t> g_guardSites[GUARD_MAX_SITES];
+static std::atomic<int>       g_guardSiteRule[GUARD_MAX_SITES];   // index into kGuardRules for each armed site
+static std::atomic<int>       g_guardLastRule{ -1 };
 static std::atomic<int>       g_guardSiteCount{ 0 };
 static std::atomic<bool>      g_guardEnabled{ true };
 static std::atomic<uint32_t>  g_guardHits{ 0 };
 static std::atomic<uintptr_t> g_guardLastRip{ 0 };
 static std::atomic<uintptr_t> g_guardBase{ 0 };
+
+// Storm breaker: a handful of hits is a harmless glitch, but a sustained burst
+// (seen live: ~9 hits/s for 40 s, then a permanent black screen with no local
+// player) means the game is stuck, not recovering. Past the limit the guard
+// stops recovering and lets the real crash happen, so the client's
+// "waiting for relaunch" path takes over instead of a zombie black screen.
+// The flight recorder is frozen at the FIRST hit of an episode, long before the
+// limit is reached, so its dump is already in the log when the breaker trips.
+static const uint64_t GUARD_STORM_WINDOW_MS = 3000;   // hits are counted inside this window
+static const uint32_t GUARD_STORM_MAX_HITS  = 15;     // more than this inside one window = storm
+static std::atomic<uint64_t>  g_guardWindowStart{ 0 };
+static std::atomic<uint32_t>  g_guardWindowHits{ 0 };
+static std::atomic<bool>      g_guardStormTripped{ false };
+
+// ---- Flight recorder (black-screen investigation) -----------------------------------------------------------
+// Symptom: some 12-16 minutes into a level the game loses its LOCAL PLAYER ("No local players" on the client
+// side): the screen goes black and the game's tick then reads a NULL player controller ~10x per second, which the
+// crash guard turns into "CRASH GUARD: recovered ..." lines instead of a crash. Nothing in the log says WHY the
+// player disappears, so this keeps the last FR_SIZE ProcessEvent calls (raw pointers only: one atomic increment
+// and three stores per call, no name lookups, no locks) and FREEZES them at the first guard hit of an episode.
+// The controller thread then resolves the names and writes them to the log (DumpFlightRecorder): the calls that
+// came right before the player vanished, plus any call to a function that can remove a local player
+// (RemovePlayer, HandleControllerConnectionChange, HandleLocalPlayerLeave, OnUserSignedOut...).
+// The VEH handler only sets atomics (no allocation, no lock, no I/O); at most one dump per minute.
+// "dump_recorder" over the pipe dumps the live ring on demand.
+static const uint32_t FR_SIZE = 16384;               // power of two
+struct FrEntry { void* fn; void* self; uint32_t tick; };
+static FrEntry                g_frRing[FR_SIZE];     // static storage = zero-initialised
+static std::atomic<uint32_t>  g_frHead{ 0 };         // total calls recorded (index = head & (FR_SIZE - 1))
+static std::atomic<bool>      g_frFrozen{ false };
+static std::atomic<uint32_t>  g_frFrozenHead{ 0 };
+static std::atomic<ULONGLONG> g_frFrozenTick{ 0 };
+static std::atomic<ULONGLONG> g_frLastDumpMs{ 0 };
+
+static inline void FlightRecord(void* self, void* function)
+{
+    if (g_frFrozen.load(std::memory_order_relaxed))
+        return;
+    const uint32_t i = g_frHead.fetch_add(1, std::memory_order_relaxed);
+    FrEntry& e = g_frRing[i & (FR_SIZE - 1)];
+    e.fn = function;
+    e.self = self;
+    e.tick = GetTickCount();
+}
+
+// Recent pipe commands from the client (everything except the polled "get_*" reads). The flight recorder dump
+// prints them with their age, so a black screen / guard storm can be matched with what the client had just asked
+// the game to do (grants, void mode, level gate ...). Diagnostic only: a torn read of a slot is harmless.
+struct CmdNote { ULONGLONG ms; char text[80]; };
+static CmdNote                g_cmdRing[32];         // static storage = zero-initialised
+static std::atomic<uint32_t>  g_cmdHead{ 0 };
+static void NoteCommand(const std::string& request)
+{
+    if (request.compare(0, 4, "get_") == 0 || request == "hook_state")
+        return;
+    CrumbAdd("PIPE", request.substr(0, 70).c_str());
+    const uint32_t i = g_cmdHead.fetch_add(1, std::memory_order_relaxed) & 31;
+    CmdNote& n = g_cmdRing[i];
+    n.ms = GetTickCount64();
+    size_t len = request.size() < sizeof(n.text) - 1 ? request.size() : sizeof(n.text) - 1;
+    for (size_t k = 0; k < len; ++k)
+        n.text[k] = (request[k] == '\n' || request[k] == '\r') ? ' ' : request[k];
+    n.text[len] = 0;
+}
+
+static void DumpFlightRecorder();   // defined with the crash guard, below
 
 enum VoidAction { VOID_NONE = 0, VOID_UNPATCH = 1, VOID_REPATCH = 2 };
 
@@ -535,6 +704,7 @@ static void SilenceLogDirect(const char* what, uint64_t world, ULONGLONG ms)
 {
     std::ostringstream o;
     o << "HOOK " << what << " (world=0x" << std::hex << world << std::dec << ", " << ms << " ms)";
+    CrumbAdd("HOOK", what, world, ms);
     LogLine(o.str());
 }
 
@@ -1033,22 +1203,47 @@ static std::condition_variable g_resultCv;
 // Uses the comma-operator trick in the filter expression to actually
 // capture the exception code (GetExceptionCode() is only valid inside
 // the filter expression itself, not the __except body).
+// Thread id that is currently inside one of OUR OWN CALLDATA calls (0 = none). The ProcessEvent address we call
+// is the same one the hook sits on, so our own call re-enters hkProcessEvent on this thread; features that block
+// a game function (merchant unlock blocking) must let our own calls through, so they compare against this.
+static std::atomic<DWORD> g_ownCallThreadId{ 0 };
+
+static LONG CaptureOwnFault(EXCEPTION_POINTERS* ep, DWORD* code)
+{
+    *code = ep->ExceptionRecord->ExceptionCode;
+    g_lastFaultAddr.store(reinterpret_cast<uint64_t>(ep->ExceptionRecord->ExceptionAddress), std::memory_order_relaxed);
+    return EXCEPTION_EXECUTE_HANDLER;
+}
+
 static bool TryProcessEventCall(uintptr_t objectAddr, uintptr_t functionAddr, uint8_t* parms, DWORD& outExceptionCode)
 {
     DWORD code = 0;
+    const DWORD previousOwner = g_ownCallThreadId.exchange(GetCurrentThreadId(), std::memory_order_relaxed);
+    g_curCallObj.store(objectAddr, std::memory_order_relaxed);
+    g_curCallFunc.store(functionAddr, std::memory_order_relaxed);
+    g_curCallStartMs.store(GetTickCount64(), std::memory_order_relaxed);
     __try
     {
         ProcessEventFn pe = GetProcessEventFn();
         if (!pe)
         {
             outExceptionCode = 0xE0000001;   // private code: no ProcessEvent RVA for this build
+            g_ownCallThreadId.store(previousOwner, std::memory_order_relaxed);
+            g_curCallObj.store(0, std::memory_order_relaxed);
+            g_curCallStartMs.store(0, std::memory_order_relaxed);
             return false;
         }
         pe(reinterpret_cast<void*>(objectAddr), reinterpret_cast<void*>(functionAddr), parms);
+        g_ownCallThreadId.store(previousOwner, std::memory_order_relaxed);
+        g_curCallObj.store(0, std::memory_order_relaxed);
+        g_curCallStartMs.store(0, std::memory_order_relaxed);
         return true;
     }
-    __except ((code = GetExceptionCode()), EXCEPTION_EXECUTE_HANDLER)
+    __except (CaptureOwnFault(GetExceptionInformation(), &code))
     {
+        g_ownCallThreadId.store(previousOwner, std::memory_order_relaxed);
+        g_curCallObj.store(0, std::memory_order_relaxed);
+        g_curCallStartMs.store(0, std::memory_order_relaxed);
         outExceptionCode = code;
         return false;
     }
@@ -1097,7 +1292,33 @@ static void DrainPendingCalls()
         }
 
         DWORD exceptionCode = 0;
+        std::string callName = "?";
+        TryGetObjectName(reinterpret_cast<void*>(req->functionAddr), callName);
+        CrumbAdd("CALL", callName.c_str(), req->objectAddr, req->functionAddr);
+        strncpy_s(g_curCallName, sizeof(g_curCallName), callName.c_str(), _TRUNCATE);
+        const ULONGLONG callStartMs = GetTickCount64();
         bool ok = TryProcessEventCall(req->objectAddr, req->functionAddr, req->parms.data(), exceptionCode);
+        {
+            const uint32_t tookMs = static_cast<uint32_t>(GetTickCount64() - callStartMs);
+            if (tookMs > g_maxCallMs.load(std::memory_order_relaxed))
+                g_maxCallMs.store(tookMs, std::memory_order_relaxed);
+            if (tookMs >= 150)
+            {
+                g_slowCalls.fetch_add(1, std::memory_order_relaxed);
+                HealthEventAdd("SLOW_CALL", (callName + " took " + std::to_string(tookMs) + " ms on the game thread").c_str(), tookMs);
+            }
+        }
+        if (!ok)
+        {
+            char where[160];
+            DescribeAddress(g_lastFaultAddr.load(std::memory_order_relaxed), where, sizeof(where));
+            CrumbAdd("CALLFAULT", callName.c_str(), exceptionCode, g_lastFaultAddr.load(std::memory_order_relaxed));
+            std::ostringstream fault;
+            fault << "CALLDATA FAULT: " << callName << " code=0x" << std::hex << exceptionCode << std::dec
+                  << " at " << where << " (object 0x" << std::hex << req->objectAddr << std::dec
+                  << ", build " << kBuildId << ") - the game call was aborted, the game keeps running";
+            LogLine(fault.str());
+        }
 
         {
             std::lock_guard<std::mutex> lock(g_resultMutex);
@@ -1504,6 +1725,124 @@ static int ClassifyPickupTier(const std::string& className)
 // unrestricted and defeating the whole progression rule.
 static std::atomic<int> g_pickupUnlockTier{ 0 };
 
+// ---- Eye of Ender pickup blocking (seed option eye_of_ender_checks) ----
+// With the option on, the Eyes of Ender the mini bosses drop are turned into CHECKS by the client (it sees the Eye
+// object appear and sends the check); the real Eye must then not be picked up as well, otherwise the player
+// would get it twice (once as the item received from the multiworld). Python switches this on with
+// "set_block_eyes 1" once per attach. DEFAULT OFF: with the flag off nothing below does anything, so an old
+// client / a seed without the option behaves exactly like before.
+//
+// What gets swallowed (same technique as the pickup tiers: the original call is simply not forwarded):
+//   * any function named like "PickUpEye" (AEyeOfEnderInstance::PickUpEye in the Dumper-7 SDK), and
+//   * every Interact-family call (OnInteract / OnInteracted, see IsInteractFamilyFunction) on an object whose
+//     class IS or DERIVES FROM the native EyeOfEnderInstance - decided by walking the class's SuperStruct chain,
+//     not by a name pattern, so it works whatever the Blueprint subclass is called. The effect of a pickup can
+//     already apply in the earlier OnInteract call (see IsInteractFamilyFunction's comment), hence the family.
+// The Eye then stays on the ground untouched; the check was already sent, so nothing else depends on it.
+static std::atomic<bool> g_blockEyePickup{ false };
+
+static const uintptr_t kUStructSuperOffset = 0x40;   // UStruct::SuperStruct - same value as OFFSETS["ustruct_super"] in dungeons_reader.py
+
+static bool TryReadSuperStruct(void* structPtr, void*& outSuper)
+{
+    __try
+    {
+        outSuper = *reinterpret_cast<void**>(reinterpret_cast<uintptr_t>(structPtr) + kUStructSuperOffset);
+        return true;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        return false;
+    }
+}
+
+static std::mutex g_eyeClassMutex;
+static std::unordered_map<void*, bool>& EyeClassCache()   // lazy: nothing allocated at DLL load
+{
+    static std::unordered_map<void*, bool> m;
+    return m;
+}
+
+// True if the object's class is, or derives from, the native class EyeOfEnderInstance. Cached per class pointer;
+// a negative is only cached when the WHOLE chain could be read (a transient name-resolve failure must not make a
+// real Eye class look like "not an Eye" for the rest of the session).
+static bool IsEyeOfEnderObject(void* self)
+{
+    void* classPtr = nullptr;
+    if (!TryReadClassPtr(self, classPtr) || !classPtr)
+        return false;
+    {
+        std::lock_guard<std::mutex> lock(g_eyeClassMutex);
+        auto it = EyeClassCache().find(classPtr);
+        if (it != EyeClassCache().end())
+            return it->second;
+    }
+
+    bool isEye = false;
+    bool chainComplete = true;
+    void* current = classPtr;
+    for (int depth = 0; depth < 16 && current; ++depth)
+    {
+        std::string name;
+        if (!TryGetObjectName(current, name))
+        {
+            chainComplete = false;
+            break;
+        }
+        if (name == "EyeOfEnderInstance")
+        {
+            isEye = true;
+            break;
+        }
+        void* next = nullptr;
+        if (!TryReadSuperStruct(current, next))
+        {
+            chainComplete = false;
+            break;
+        }
+        current = next;
+    }
+
+    if (isEye || chainComplete)
+    {
+        std::lock_guard<std::mutex> lock(g_eyeClassMutex);
+        EyeClassCache()[classPtr] = isEye;
+    }
+    return isEye;
+}
+
+static std::mutex g_eyePickupFnMutex;
+static std::unordered_set<void*> g_eyePickupFunctionPtrs;
+static std::unordered_set<void*> g_nonEyePickupFunctionPtrs;
+
+// UFunction named like "PickUpEye" (AEyeOfEnderInstance::PickUpEye). Cached like the other function classifiers.
+static bool IsEyePickupFunction(void* function)
+{
+    {
+        std::lock_guard<std::mutex> lock(g_eyePickupFnMutex);
+        if (g_eyePickupFunctionPtrs.count(function))
+            return true;
+        if (g_nonEyePickupFunctionPtrs.count(function))
+            return false;
+    }
+
+    std::string name;
+    const bool resolved = TryGetObjectName(function, name);
+    const bool isMatch = resolved && name.find("PickUpEye") != std::string::npos;
+
+    std::lock_guard<std::mutex> lock(g_eyePickupFnMutex);
+    if (isMatch)
+    {
+        g_eyePickupFunctionPtrs.insert(function);
+        LogLine("Classified Eye of Ender pickup function (blocking-eligible): " + name);
+    }
+    else if (ShouldCacheNegative(function, resolved))
+    {
+        g_nonEyePickupFunctionPtrs.insert(function);
+    }
+    return isMatch;
+}
+
 typedef void(*ProcessEventHookFn)(void*, void*, void*);
 static ProcessEventHookFn oProcessEvent = nullptr;
 
@@ -1551,7 +1890,171 @@ struct SecretFoundEvent
 {
     uint64_t actorAddr;
     std::string className;
+    std::string funcName;   // "SecretFound" (any secret in a level, hidden chests included)
+                            // or "ShowSecretMissionUnlocked" (the game announcing that a
+                            // secret MISSION was unlocked - the one the client turns into
+                            // the "Secret Zone Found" check)
 };
+
+// When true, hkProcessEvent swallows SecretFound / ExecuteSecretFound (the
+// event is still captured + queued for get_secret_events first), so the
+// game's own "reveal the secret mission" logic never runs - the Python
+// client turns that event into an Archipelago check instead. OFF by default;
+// toggled by the "set_secret_block 0|1" pipe command, only enabled by the
+// client when the Secret Mission Access option is on.
+// Level: 0 = off, 1 = swallow SecretFound / ExecuteSecretFound, 2 = also swallow
+// the Blueprint handler whose name contains "OnSecretFoundRecieved" (the game's
+// own spelling). Level 2 exists because it isn't known yet which of these
+// actually performs the unlock - see the SECRET TRACE lines in the debug log.
+static std::atomic<int> g_blockSecretFound{ 0 };
+
+// ---- Secret trace (diagnostic, always on, near-zero cost) -----------------
+// Every ProcessEvent call drops its function pointer into a ring buffer (one
+// relaxed fetch_add + one store). When a SecretFound event fires, the ring is
+// dumped to the debug log - names filtered to unlock/mission/secret-ish ones -
+// and the following 3 s of calls are logged the same way. That reveals which
+// game function really performs the secret-mission unlock (and whether it
+// runs before or after ExecuteSecretFound), so the right one can be blocked.
+static const size_t SECRET_RING_SIZE = 16384;   // power of two
+static void* g_secretRing[SECRET_RING_SIZE];
+static std::atomic<uint32_t> g_secretRingIdx{ 0 };
+static std::atomic<ULONGLONG> g_secretTraceUntil{ 0 };
+static std::mutex g_secretTraceMutex;
+static std::unordered_set<void*> g_secretTraceSeen;
+
+static bool SecretTraceInteresting(const std::string& name)
+{
+    std::string n = ToLowerCopy(name);
+    return n.find("secret") != std::string::npos || n.find("unlock") != std::string::npos
+        || n.find("bonus") != std::string::npos || n.find("mission") != std::string::npos
+        || n.find("reveal") != std::string::npos || n.find("discover") != std::string::npos;
+}
+
+static void SecretTraceDumpRing()
+{
+    std::unordered_set<void*> distinct;
+    for (size_t i = 0; i < SECRET_RING_SIZE; ++i)
+        if (g_secretRing[i]) distinct.insert(g_secretRing[i]);
+    int logged = 0;
+    LogLine("SECRET TRACE: functions called shortly BEFORE this event (" + std::to_string(distinct.size()) + " distinct, filtered):");
+    for (void* f : distinct)
+    {
+        std::string name;
+        if (TryGetObjectName(f, name) && SecretTraceInteresting(name) && logged < 80)
+        {
+            LogLine("SECRET TRACE (before): " + name);
+            ++logged;
+        }
+    }
+    std::lock_guard<std::mutex> lock(g_secretTraceMutex);
+    g_secretTraceSeen.clear();
+    g_secretTraceUntil.store(GetTickCount64() + 3000, std::memory_order_relaxed);
+}
+
+// ---- Merchant (captured villager) unlock: capture + optional blocking (seed option villager_checks) ----
+// Freeing a captured villager unlocks that merchant in the camp through UMerchantsUtil::UnlockMerchantForAllLocalPlayers
+// (static, params: WorldContext @0x00, TSubclassOf<UMerchantDef> Def @0x08) and/or APlayerCharacter::ClientUnlockMerchant
+// (param: Def @0x00) - names from the Dumper-7 SDK, not yet confirmed at runtime: the first time one of them fires
+// the debug log says so. Every call that is NOT one of our own (see g_ownCallThreadId) is queued for the Python
+// client (get_merchant_events), which turns it into an Archipelago check. With "set_block_merchants 1" the call is
+// also swallowed, so the merchant only unlocks when the matching Archipelago item arrives (the client then calls
+// UnlockMerchantForAllLocalPlayers itself, which is let through because it is one of our own calls).
+// Blocking is limited to merchant definitions whose class name contains one of the tokens the client sent along
+// with "set_block_merchants 1 <token,token,...>" (never the Tower merchants): the camp merchants that are NOT
+// captured villagers (Enchanter, Piglin... and anything the client does not know) keep unlocking normally.
+// DEFAULT OFF: with the flag off the call still runs normally and is only reported.
+struct MerchantUnlockEvent
+{
+    uint64_t defAddr;
+    std::string defName;    // name of the UClass passed as the merchant definition
+    std::string funcName;   // which UFunction fired
+};
+
+static std::atomic<bool> g_blockMerchantUnlock{ false };
+static std::mutex g_merchantTokensMutex;
+static std::vector<std::string> g_merchantBlockTokens;      // lowercase fragments of the merchant definition class names to block
+static std::mutex g_merchantEventsMutex;
+static std::vector<MerchantUnlockEvent> g_merchantEvents;   // drained by the pipe thread via get_merchant_events
+
+static std::mutex g_merchantFnMutex;
+static std::unordered_map<void*, int> g_merchantFnKind;     // function -> 0 not a merchant unlock, 1 ForAllLocalPlayers, 2 ClientUnlockMerchant
+
+static int ClassifyMerchantUnlockFunction(void* function)
+{
+    {
+        std::lock_guard<std::mutex> lock(g_merchantFnMutex);
+        auto it = g_merchantFnKind.find(function);
+        if (it != g_merchantFnKind.end())
+            return it->second;
+    }
+    std::string name;
+    const bool resolved = TryGetObjectName(function, name);
+    int kind = 0;
+    if (resolved)
+    {
+        if (name == "UnlockMerchantForAllLocalPlayers")
+            kind = 1;
+        else if (name == "ClientUnlockMerchant")
+            kind = 2;
+    }
+    if (kind != 0 || ShouldCacheNegative(function, resolved))
+    {
+        std::lock_guard<std::mutex> lock(g_merchantFnMutex);
+        g_merchantFnKind[function] = kind;
+        if (kind != 0)
+            LogLine("Classified merchant unlock function: " + name);
+    }
+    return kind;
+}
+
+static bool MerchantDefIsBlockable(const std::string& defName)
+{
+    const std::string lower = ToLowerCopy(defName);
+    if (lower.find("tower") != std::string::npos)
+        return false;
+    std::lock_guard<std::mutex> lock(g_merchantTokensMutex);
+    for (const std::string& token : g_merchantBlockTokens)
+        if (!token.empty() && lower.find(token) != std::string::npos)
+            return true;
+    return false;
+}
+
+// Queues the event and returns the merchant definition's class name through outDefName.
+static void CaptureMerchantUnlockEvent(void* params, int kind, std::string& outDefName)
+{
+    if (!params)
+        return;
+    const uint8_t* base = reinterpret_cast<const uint8_t*>(params);
+    const uint64_t defAddr = *reinterpret_cast<const uint64_t*>(base + (kind == 1 ? 0x08 : 0x00));
+    MerchantUnlockEvent evt;
+    evt.defAddr = defAddr;
+    evt.funcName = (kind == 1) ? "UnlockMerchantForAllLocalPlayers" : "ClientUnlockMerchant";
+    evt.defName = "?";
+    if (defAddr)
+        TryGetObjectName(reinterpret_cast<void*>(defAddr), evt.defName);
+    LogLine("MERCHANT UNLOCK seen: " + evt.funcName + " def=" + evt.defName);
+    CrumbAdd("MERCHANT", evt.defName.c_str(), defAddr, kind);
+    outDefName = evt.defName;
+    std::lock_guard<std::mutex> lock(g_merchantEventsMutex);
+    if (g_merchantEvents.size() < 256)
+        g_merchantEvents.push_back(std::move(evt));
+}
+
+// Diagnostic only (no behaviour): which functions the game runs on a captured villager / camp villager actor. The
+// interact-family hook already computed the class name, so this costs nothing for other actors. Rate limited.
+static void LogVillagerInteract(void* function, const std::string& className)
+{
+    if (className.find("CapturedVillager") == std::string::npos && className.find("LobbyVillager") == std::string::npos)
+        return;
+    static std::atomic<ULONGLONG> lastMs{ 0 };
+    const ULONGLONG nowMs = GetTickCount64();
+    if (nowMs - lastMs.load(std::memory_order_relaxed) < 1000)
+        return;
+    lastMs.store(nowMs, std::memory_order_relaxed);
+    std::string fname = "?";
+    TryGetObjectName(function, fname);
+    LogLine("VILLAGER interact: " + fname + " on " + className);
+}
 
 static std::mutex g_secretEventsMutex;
 static std::vector<SecretFoundEvent> g_secretEvents;   // drained by the pipe thread via get_secret_events
@@ -1599,7 +2102,53 @@ static bool IsSecretFoundFunction(void* function)
     return isExactMatch;
 }
 
-static void CaptureSecretFoundEvent(void* self)
+static std::mutex g_secretHandlerMutex;
+static std::unordered_set<void*> g_secretHandlerPtrs;
+static std::unordered_set<void*> g_nonSecretHandlerPtrs;
+
+// The Blueprint-side handler bound to the Secret component's delegate
+// (BndEvt__Secret_..._OnSecretFoundRecieved__DelegateSignature).
+static bool IsSecretHandlerFunction(void* function)
+{
+    {
+        std::lock_guard<std::mutex> lock(g_secretHandlerMutex);
+        if (g_secretHandlerPtrs.count(function)) return true;
+        if (g_nonSecretHandlerPtrs.count(function)) return false;
+    }
+    std::string name;
+    bool resolved = TryGetObjectName(function, name);
+    bool match = resolved && name.find("OnSecretFoundRecieved") != std::string::npos;
+    std::lock_guard<std::mutex> lock(g_secretHandlerMutex);
+    if (match) g_secretHandlerPtrs.insert(function);
+    else if (ShouldCacheNegative(function, resolved)) g_nonSecretHandlerPtrs.insert(function);
+    return match;
+}
+
+// ShowSecretMissionUnlocked: the UI-side function the game runs when a secret
+// mission gets unlocked (it also runs for OUR ClientUnlockBonusMission popups -
+// the Python client discards events that fall right after its own call).
+// Never blocked: blocking it would kill our own popup too.
+static std::mutex g_secretPopupMutex;
+static std::unordered_set<void*> g_secretPopupPtrs;
+static std::unordered_set<void*> g_nonSecretPopupPtrs;
+
+static bool IsSecretUnlockedPopupFunction(void* function)
+{
+    {
+        std::lock_guard<std::mutex> lock(g_secretPopupMutex);
+        if (g_secretPopupPtrs.count(function)) return true;
+        if (g_nonSecretPopupPtrs.count(function)) return false;
+    }
+    std::string name;
+    bool resolved = TryGetObjectName(function, name);
+    bool match = resolved && name == "ShowSecretMissionUnlocked";
+    std::lock_guard<std::mutex> lock(g_secretPopupMutex);
+    if (match) g_secretPopupPtrs.insert(function);
+    else if (ShouldCacheNegative(function, resolved)) g_nonSecretPopupPtrs.insert(function);
+    return match;
+}
+
+static void CaptureSecretFoundEvent(void* self, const char* funcName)
 {
     std::string className;
     if (!TryGetClassName(self, className))
@@ -1608,6 +2157,7 @@ static void CaptureSecretFoundEvent(void* self)
     SecretFoundEvent evt;
     evt.actorAddr = reinterpret_cast<uint64_t>(self);
     evt.className = className;
+    evt.funcName = funcName;
 
     std::lock_guard<std::mutex> lock(g_secretEventsMutex);
     g_secretEvents.push_back(evt);
@@ -1910,6 +2460,136 @@ static void CaptureMissionOutcomeEvent(void* self, const std::string& triggerNam
 // inside a plain __try block, rather than annotating hkProcessEvent in place.
 // blockedOut is an out-param since __except's filter can't see local
 // variables declared inside the __try'd call in the caller's scope.
+// ---- Level gate (refuse a locked mission at the camp instead of killing the player inside it) -----------
+// UMissionSelectorComponent (SDK, Dungeons_classes.hpp):
+//   bool TryStartMissionSelection(APlayerCharacter*, const FMissionSelection&)
+//        params: +0x00 player, +0x08 FMissionSelection{ELevelNames levelName at +0x08}, ReturnValue at +0x10
+//   bool TryContinueMission(APlayerCharacter*, ELevelNames)
+//        params: +0x00 player, +0x08 levelName, ReturnValue at +0x09
+// Setting ReturnValue = false and swallowing the call = "the game refused to start that mission".
+// ServerRequestLevel / ServerAccept / ServerReject / TravelToMission / ClientLevelRequested are TRACE ONLY
+// (they carry no ELevelNames; the request's map name sits in ALobbyActor::mRequest.LevelSettings).
+// IMPORTANT: this only works if the game calls these through ProcessEvent. Both are native BlueprintCallable
+// functions; if the UI calls them directly the trace below will simply never show them - see the
+// "LEVEL GATE" lines in the debug log after one test in the camp.
+// Mode 0 = trace only, 1 = deny the levels sent by "set_level_gate <mode> <id,id,...>".
+static std::atomic<int> g_levelGateMode{ 0 };
+static std::atomic<uint8_t> g_lockedLevel[256];
+static std::atomic<uint64_t> g_levelGateDenied{ 0 };
+static std::mutex g_gateFnMutex;
+static std::unordered_map<void*, int>& GateFnCache()   // lazy: nothing allocated at DLL load
+{
+    static std::unordered_map<void*, int> m;
+    return m;
+}
+enum GateFn { GF_NONE = 0, GF_TRY_START = 1, GF_TRY_CONTINUE = 2, GF_REQUEST = 3, GF_ACCEPT = 4,
+              GF_REJECT = 5, GF_TRAVEL = 6, GF_CLIENT_REQUESTED = 7 };
+static const char* const kGateFnNames[] = { "", "TryStartMissionSelection", "TryContinueMission", "ServerRequestLevel",
+                                            "ServerAccept", "ServerReject", "TravelToMission", "ClientLevelRequested" };
+
+static int ClassifyGateFunction(void* function)
+{
+    {
+        std::lock_guard<std::mutex> lock(g_gateFnMutex);
+        auto it = GateFnCache().find(function);
+        if (it != GateFnCache().end())
+            return it->second;
+    }
+    std::string name;
+    if (!TryGetObjectName(function, name))
+        return GF_NONE;   // transient failure: do not cache
+    int kind = GF_NONE;
+    for (int k = 1; k <= GF_CLIENT_REQUESTED; ++k)
+        if (name == kGateFnNames[k]) { kind = k; break; }
+    std::lock_guard<std::mutex> lock(g_gateFnMutex);
+    GateFnCache()[function] = kind;
+    return kind;
+}
+
+// POD-only helpers (a __try block cannot live in a function that has C++ objects needing unwinding).
+static bool GateReadByte(uintptr_t addr, uint8_t& out)
+{
+    __try { out = *reinterpret_cast<const uint8_t*>(addr); return true; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+static bool GateWriteByte(uintptr_t addr, uint8_t v)
+{
+    __try { *reinterpret_cast<uint8_t*>(addr) = v; return true; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+static bool GateReadPtr(uintptr_t addr, uintptr_t& out)
+{
+    __try { out = *reinterpret_cast<const uintptr_t*>(addr); return true; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+// FString = { wchar_t* Data; int32 Num; int32 Max } at addr.
+static bool GateReadWideFString(uintptr_t addr, wchar_t* buf, int cap, int& len)
+{
+    __try
+    {
+        const wchar_t* data = *reinterpret_cast<const wchar_t* const*>(addr);
+        int32_t num = *reinterpret_cast<const int32_t*>(addr + 8);
+        if (!data || num <= 0 || num >= cap) return false;
+        for (int i = 0; i < num; ++i) buf[i] = data[i];
+        buf[num] = 0;
+        len = num;
+        return true;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+static std::string GateFString(uintptr_t addr)
+{
+    wchar_t buf[512];
+    int len = 0;
+    if (!GateReadWideFString(addr, buf, 512, len))
+        return "<unreadable>";
+    int n = WideCharToMultiByte(CP_UTF8, 0, buf, len, nullptr, 0, nullptr, nullptr);
+    if (n <= 0) return "<unreadable>";
+    std::string r(n, '\0');
+    WideCharToMultiByte(CP_UTF8, 0, buf, len, &r[0], n, nullptr, nullptr);
+    while (!r.empty() && r.back() == '\0') r.pop_back();
+    return r;
+}
+
+static void GateHandle(void* self, void* params, int kind, bool* blocked)
+{
+    std::string cls;
+    if (!TryGetClassName(self, cls) || cls.find("MissionSelectorComponent") == std::string::npos)
+        return;
+    const int mode = g_levelGateMode.load(std::memory_order_relaxed);
+    const std::string fname = kGateFnNames[kind];
+
+    if (kind == GF_TRY_START || kind == GF_TRY_CONTINUE)
+    {
+        uint8_t id = 0;
+        if (!params || !GateReadByte(reinterpret_cast<uintptr_t>(params) + 0x08, id))
+            return;
+        const bool locked = mode >= 1 && g_lockedLevel[id].load(std::memory_order_relaxed) != 0;
+        LogLine("LEVEL GATE: " + fname + " level id " + std::to_string(id) +
+                (locked ? " -> DENIED" : " -> allowed") + " (gate " + (mode >= 1 ? "on" : "off") + ")");
+        if (locked)
+        {
+            GateWriteByte(reinterpret_cast<uintptr_t>(params) + (kind == GF_TRY_START ? 0x10 : 0x09), 0);   // ReturnValue = false
+            *blocked = true;
+            g_levelGateDenied.fetch_add(1, std::memory_order_relaxed);
+        }
+        return;
+    }
+
+    // Trace only: what the lobby actor says the pending request is (names to build the next, denying hook).
+    std::string line = "LEVEL GATE TRACE: " + fname;
+    uintptr_t lobby = 0;
+    if (GateReadPtr(reinterpret_cast<uintptr_t>(self) + 0x128, lobby) && lobby)   // mLobbyActor
+    {
+        // ALobbyActor::mRequest at 0x370; FLevelRequest::LevelSettings at +0x18; unrealMapName +0x1A0, levelFilename +0x1B0
+        line += " | unrealMapName=" + GateFString(lobby + 0x370 + 0x18 + 0x1A0) +
+                " | levelFilename=" + GateFString(lobby + 0x370 + 0x18 + 0x1B0);
+        uint8_t reqLevel = 0;
+        (void)reqLevel;
+    }
+    LogLine(line);
+}
+
 void hkProcessEvent_Impl(void* self, void* function, void* params, bool* blockedOut)
 {
     // Services queued CALL/CALLDATA requests (see HandleCall/HandleCallData)
@@ -1932,7 +2612,10 @@ void hkProcessEvent_Impl(void* self, void* function, void* params, bool* blocked
 
     uint64_t callNum = g_processEventCallCount.fetch_add(1, std::memory_order_relaxed);
     if (callNum == 0)
+    {
+        g_hookThreadId.store(GetCurrentThreadId(), std::memory_order_relaxed);
         LogLine("hkProcessEvent: first call received - hook is definitely firing.");
+    }
 
     bool blocked = false;
 
@@ -1940,18 +2623,62 @@ void hkProcessEvent_Impl(void* self, void* function, void* params, bool* blocked
     // "OnInteracted") - the actual pickup effect can apply during the
     // EARLIER "OnInteract" call, so only blocking "OnInteracted" let it
     // through too late to matter. See IsInteractFamilyFunction's comment.
-    if (IsInteractFamilyFunction(function))
+    const bool isInteractFn = IsInteractFamilyFunction(function);   // classified once, reused by the eye block below
+    if (isInteractFn)
     {
         std::string className;
         if (TryGetClassName(self, className))
         {
+            LogVillagerInteract(function, className);
             int tier = ClassifyPickupTier(className);
             int unlocked = g_pickupUnlockTier.load(std::memory_order_relaxed);
             if (tier > 0 && tier > unlocked)
             {
                 blocked = true;
+                g_blockedPickup.fetch_add(1, std::memory_order_relaxed);
                 LogLine("BLOCKED pickup (tier " + std::to_string(tier) + " > unlocked " +
                          std::to_string(unlocked) + "): " + className);
+            }
+        }
+    }
+
+    // Eye of Ender pickup blocking (see the g_blockEyePickup comment). Off unless Python enabled it.
+    if (!blocked && g_blockEyePickup.load(std::memory_order_relaxed))
+    {
+        bool eyeCall = IsEyePickupFunction(function);
+        if (!eyeCall && isInteractFn)
+            eyeCall = IsEyeOfEnderObject(self);
+        if (eyeCall)
+        {
+            blocked = true;
+            g_blockedEye.fetch_add(1, std::memory_order_relaxed);
+            // A held interact key calls this every frame: log at most once per second.
+            static std::atomic<ULONGLONG> lastEyeBlockLogMs{ 0 };
+            const ULONGLONG nowMs = GetTickCount64();
+            if (nowMs - lastEyeBlockLogMs.load(std::memory_order_relaxed) >= 1000)
+            {
+                lastEyeBlockLogMs.store(nowMs, std::memory_order_relaxed);
+                std::string eyeClassName = "?";
+                TryGetClassName(self, eyeClassName);
+                LogLine("BLOCKED Eye of Ender pickup (the Eye is a check now): " + eyeClassName);
+            }
+        }
+    }
+
+    // Merchant unlock (captured villager freed): report it, and swallow it when Python enabled blocking.
+    // Our own CALLDATA calls pass through here too - they are never reported and never blocked.
+    {
+        const int merchantKind = ClassifyMerchantUnlockFunction(function);
+        if (merchantKind != 0 && g_ownCallThreadId.load(std::memory_order_relaxed) != GetCurrentThreadId())
+        {
+            std::string merchantDefName;
+            CaptureMerchantUnlockEvent(params, merchantKind, merchantDefName);
+            if (g_blockMerchantUnlock.load(std::memory_order_relaxed) && MerchantDefIsBlockable(merchantDefName))
+            {
+                blocked = true;
+                g_blockedMerchant.fetch_add(1, std::memory_order_relaxed);
+                LogLine("BLOCKED merchant unlock (the villager is a check now): " + merchantDefName);
+                CrumbAdd("BLOCK", merchantDefName.c_str());
             }
         }
     }
@@ -2021,8 +2748,59 @@ void hkProcessEvent_Impl(void* self, void* function, void* params, bool* blocked
     if (IsDeathFunction(function))
         CaptureDeathEvent(self);
 
-    if (IsSecretFoundFunction(function))
-        CaptureSecretFoundEvent(self);
+    // ring buffer for the secret trace (see g_secretRing)
+    g_secretRing[g_secretRingIdx.fetch_add(1, std::memory_order_relaxed) & (SECRET_RING_SIZE - 1)] = function;
+
+    {
+        int blockLevel = g_blockSecretFound.load(std::memory_order_relaxed);
+        if (IsSecretFoundFunction(function))
+        {
+            CaptureSecretFoundEvent(self, "SecretFound");
+            SecretTraceDumpRing();
+            if (blockLevel >= 1)
+            {
+                blocked = true;
+                g_blockedSecret.fetch_add(1, std::memory_order_relaxed);
+                LogLine("BLOCKED SecretFound/ExecuteSecretFound (sent to client as a check instead of unlocking the secret mission)");
+            }
+        }
+        else if (blockLevel >= 2 && IsSecretHandlerFunction(function))
+        {
+            blocked = true;
+            g_blockedSecret.fetch_add(1, std::memory_order_relaxed);
+            LogLine("BLOCKED OnSecretFoundRecieved handler (level 2)");
+        }
+        else if (IsSecretUnlockedPopupFunction(function))
+        {
+            CaptureSecretFoundEvent(self, "ShowSecretMissionUnlocked");
+            LogLine("ShowSecretMissionUnlocked fired (secret mission unlock announced by the game)");
+        }
+
+        // the 3 s after a secret event: log every distinct interesting function once
+        ULONGLONG traceUntil = g_secretTraceUntil.load(std::memory_order_relaxed);
+        if (traceUntil != 0)
+        {
+            if (GetTickCount64() > traceUntil)
+                g_secretTraceUntil.store(0, std::memory_order_relaxed);
+            else
+            {
+                bool first;
+                {
+                    std::lock_guard<std::mutex> lock(g_secretTraceMutex);
+                    first = g_secretTraceSeen.insert(function).second;
+                }
+                std::string fname;
+                if (first && TryGetObjectName(function, fname) && SecretTraceInteresting(fname))
+                    LogLine("SECRET TRACE (after): " + fname);
+            }
+        }
+    }
+
+    {
+        const int gateKind = ClassifyGateFunction(function);
+        if (gateKind != GF_NONE)
+            GateHandle(self, params, gateKind, &blocked);
+    }
 
     // Currency widget cross-check (see the block above g_currencyPtr's
     // section for why this exists). Gated on the INSTANCE's class name
@@ -2108,6 +2886,8 @@ void hkProcessEvent(void* self, void* function, void* params)
         oProcessEvent(self, function, params);
         return;
     }
+
+    FlightRecord(self, function);   // black-screen investigation, see "Flight recorder"
 
     bool blocked = false;
     __try
@@ -2252,6 +3032,7 @@ static uintptr_t FindPattern(const uint8_t* pattern, size_t patternLen)
 
 std::string HandleRequest(const std::string& request)
 {
+    NoteCommand(request);
     if (request == "get_currency_ptr")
     {
         // hkCurrencyGetter/g_currencyPtr permanently removed - confirmed
@@ -2342,7 +3123,7 @@ std::string HandleRequest(const std::string& request)
         out << "EVENTS:" << std::dec << drained.size();
         for (const auto& e : drained)
         {
-            out << "|" << std::hex << e.actorAddr << std::dec << "," << e.className;
+            out << "|" << std::hex << e.actorAddr << std::dec << "," << e.className << "," << e.funcName;
         }
         return out.str();
     }
@@ -2363,6 +3144,47 @@ std::string HandleRequest(const std::string& request)
         return out.str();
     }
 
+    if (request.rfind("set_level_gate ", 0) == 0)
+    {
+        // "set_level_gate <mode> <id,id,...>": mode 0 = trace only, 1 = deny; ids are ELevelNames values (1..255).
+        std::string body = request.substr(std::string("set_level_gate ").size());
+        int mode = body.empty() ? 0 : (body[0] - '0');
+        if (mode < 0 || mode > 1) mode = 0;
+        for (int i = 0; i < 256; ++i) g_lockedLevel[i].store(0, std::memory_order_relaxed);
+        int count = 0;
+        size_t sp = body.find(' ');
+        if (sp != std::string::npos)
+        {
+            std::string csv = body.substr(sp + 1);
+            size_t pos = 0;
+            while (pos < csv.size())
+            {
+                size_t comma = csv.find(',', pos);
+                std::string tok = csv.substr(pos, comma == std::string::npos ? std::string::npos : comma - pos);
+                int id = atoi(tok.c_str());
+                if (id >= 1 && id <= 255) { g_lockedLevel[id].store(1, std::memory_order_relaxed); ++count; }
+                if (comma == std::string::npos) break;
+                pos = comma + 1;
+            }
+        }
+        g_levelGateMode.store(mode, std::memory_order_relaxed);
+        LogLine("set_level_gate: mode " + std::to_string(mode) + ", " + std::to_string(count) + " level id(s) refused");
+        return "OK";
+    }
+
+    if (request == "get_level_gate")
+        return std::to_string(g_levelGateMode.load()) + "," + std::to_string(g_levelGateDenied.load());
+
+    if (request.rfind("set_secret_block ", 0) == 0)
+    {
+        std::string body = request.substr(std::string("set_secret_block ").size());
+        int level = body.empty() ? 0 : (body[0] - '0');
+        if (level < 0 || level > 2) level = 0;
+        g_blockSecretFound.store(level, std::memory_order_relaxed);
+        LogLine("set_secret_block: level " + std::to_string(level));
+        return "OK";
+    }
+
     if (request.rfind("set_pickup_tier ", 0) == 0)
     {
         std::string body = request.substr(std::string("set_pickup_tier ").size());
@@ -2377,6 +3199,150 @@ std::string HandleRequest(const std::string& request)
         {
             return "ERROR: invalid tier value";
         }
+    }
+
+    if (request.rfind("set_block_merchants ", 0) == 0)
+    {
+        // "set_block_merchants 1 villagemerchant,mysterymerchant" / "set_block_merchants 0"
+        const std::string body = request.substr(std::string("set_block_merchants ").size());
+        const bool enable = !body.empty() && body[0] == '1';
+        std::vector<std::string> tokens;
+        if (enable && body.size() > 2)
+        {
+            std::string current;
+            for (size_t i = 2; i <= body.size(); ++i)
+            {
+                if (i == body.size() || body[i] == ',')
+                {
+                    if (!current.empty())
+                        tokens.push_back(ToLowerCopy(current));
+                    current.clear();
+                }
+                else if (body[i] != ' ')
+                    current.push_back(body[i]);
+            }
+        }
+        {
+            std::lock_guard<std::mutex> lock(g_merchantTokensMutex);
+            g_merchantBlockTokens = tokens;
+        }
+        g_blockMerchantUnlock.store(enable, std::memory_order_relaxed);
+        LogLine(std::string("set_block_merchants: merchant unlock blocking ") + (enable ? "ON" : "OFF") +
+                " (" + std::to_string(tokens.size()) + " name fragment(s))");
+        return "OK";
+    }
+
+    if (request == "get_block_merchants")
+    {
+        return g_blockMerchantUnlock.load(std::memory_order_relaxed) ? "BLOCK_MERCHANTS:1" : "BLOCK_MERCHANTS:0";
+    }
+
+    if (request == "get_merchant_events")
+    {
+        std::vector<MerchantUnlockEvent> drained;
+        {
+            std::lock_guard<std::mutex> lock(g_merchantEventsMutex);
+            std::swap(drained, g_merchantEvents);
+        }
+        std::ostringstream out;
+        out << "EVENTS:" << std::dec << drained.size();
+        for (const auto& e : drained)
+            out << "|" << std::hex << e.defAddr << std::dec << "," << e.defName << "," << e.funcName;
+        return out.str();
+    }
+
+    if (request.rfind("set_block_eyes ", 0) == 0)
+    {
+        const std::string body = request.substr(std::string("set_block_eyes ").size());
+        const bool enable = !body.empty() && body[0] == '1';
+        g_blockEyePickup.store(enable, std::memory_order_relaxed);
+        LogLine(std::string("set_block_eyes: Eye of Ender pickup blocking ") + (enable ? "ON" : "OFF"));
+        return "OK";
+    }
+
+    if (request == "get_health")
+    {
+        const ULONGLONG now = GetTickCount64();
+        const ULONGLONG changed = g_lastPeChangeMs.load(std::memory_order_relaxed);
+        const ULONGLONG callStart = g_curCallStartMs.load(std::memory_order_relaxed);
+        std::ostringstream out;
+        out << "HEALTH:peIdleMs=" << (changed && now >= changed ? now - changed : 0)
+            << "|silent=" << (g_hookSilent.load(std::memory_order_relaxed) ? 1 : 0)
+            << "|stalled=" << (g_stalled.load(std::memory_order_relaxed) ? 1 : 0)
+            << "|ownCallMs=" << (callStart && now >= callStart ? now - callStart : 0)
+            << "|slowCalls=" << g_slowCalls.load(std::memory_order_relaxed)
+            << "|maxCallMs=" << g_maxCallMs.load(std::memory_order_relaxed)
+            << "|guardHits=" << g_guardHits.load(std::memory_order_relaxed)
+            << "|blockedPickup=" << g_blockedPickup.load(std::memory_order_relaxed)
+            << "|blockedEye=" << g_blockedEye.load(std::memory_order_relaxed)
+            << "|blockedSecret=" << g_blockedSecret.load(std::memory_order_relaxed)
+            << "|blockedMerchant=" << g_blockedMerchant.load(std::memory_order_relaxed)
+            << "|inLevelMs=" << (now - g_lastWorldChange.load(std::memory_order_relaxed));
+        return out.str();
+    }
+
+    if (request == "get_health_events")
+    {
+        std::vector<HealthEvent> drained;
+        {
+            std::lock_guard<std::mutex> lock(g_healthMutex);
+            std::swap(drained, g_healthEvents);
+        }
+        const ULONGLONG now = GetTickCount64();
+        std::ostringstream out;
+        out << "EVENTS:" << drained.size();
+        for (const HealthEvent& e : drained)
+        {
+            std::string text = e.text;
+            for (char& ch : text)
+                if (ch == ',' || ch == '|' || ch == '\n')
+                    ch = ';';
+            out << "|" << (now >= e.tick ? now - e.tick : 0) << "," << e.kind << "," << text << "," << e.value;
+        }
+        return out.str();
+    }
+
+    if (request == "health_selftest")
+    {
+        // Proves the freeze snapshot works WITHOUT a freeze: takes one hang sample of the game thread right now.
+        CrumbAdd("SELFTEST", "hang sample requested");
+        WriteHangSample(g_hookThreadId.load(std::memory_order_relaxed), 0, GameWindowIsForeground(), 0);
+        return "OK";
+    }
+
+    if (request == "get_build_info")
+    {
+        return std::string("BUILD:") + kBuildId + "|FEATURES:" + kFeatures;
+    }
+
+    if (request == "get_crumbs")
+    {
+        return "CRUMBS:\n" + CrumbsToString(60);
+    }
+
+    if (request == "crash_selftest")
+    {
+        // Proves the crash reporter works WITHOUT crashing anything: a deliberate, caught access violation on this
+        // (pipe) thread. A "CRASH REPORT" must show up in dungeons_bridge_crash.log; the game never notices.
+        CrumbAdd("SELFTEST", "deliberate caught access violation");
+        CrashSelfTestFault();
+        return "OK";
+    }
+
+    if (request == "dump_recorder")
+    {
+        // On-demand flight recorder dump (e.g. right after a black screen with no guard hit): freezes the ring
+        // now, logs it, resumes recording. The result is in the DLL log ("FLIGHT RECORDER: ...").
+        g_frFrozenHead.store(g_frHead.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        g_frFrozenTick.store(GetTickCount64(), std::memory_order_relaxed);
+        g_frFrozen.store(true, std::memory_order_release);
+        DumpFlightRecorder();
+        return "OK";
+    }
+
+    if (request == "get_block_eyes")
+    {
+        return g_blockEyePickup.load(std::memory_order_relaxed) ? "BLOCK_EYES:1" : "BLOCK_EYES:0";
     }
 
     if (request == "get_pickup_tier")
@@ -2414,7 +3380,12 @@ std::string HandleRequest(const std::string& request)
     {
         std::string m = request.substr(std::string("set_crash_guard ").size());
         while (!m.empty() && (m.back() == '\n' || m.back() == '\r' || m.back() == ' ')) m.pop_back();
-        if (m == "on")       g_guardEnabled.store(true);
+        if (m == "on")
+        {
+            g_guardWindowHits.store(0);
+            g_guardStormTripped.store(false);
+            g_guardEnabled.store(true);
+        }
         else if (m == "off") g_guardEnabled.store(false);
         else                 return "ERROR: crash guard must be on or off";
         LogLine("CRASH GUARD (live override): " + m);
@@ -2424,7 +3395,8 @@ std::string HandleRequest(const std::string& request)
     {
         std::ostringstream out;
         out << "GUARD:enabled=" << (g_guardEnabled.load() ? 1 : 0)
-            << ",sites=" << g_guardSiteCount.load() << ",hits=" << g_guardHits.load();
+            << ",sites=" << g_guardSiteCount.load() << ",hits=" << g_guardHits.load()
+            << ",storm=" << (g_guardStormTripped.load() ? 1 : 0);
         return out.str();
     }
     if (request == "get_void_mode")
@@ -2626,49 +3598,119 @@ static void WorldWatchThread()
 // controller exists at that moment - the log lines around each guard hit,
 // written by VoidControllerThread, are there to find out).
 
-// -1 = wildcard
-static const int16_t kGuardPattern[] = {
+// A guard RULE describes one known "null object" crash site of the game. Rule 0 is the crash described above. Rule 1
+// was added after a third live crash (UE4Minidump, 2026-10-14, 96 min after the game started, unhandled exception,
+// no dungeons_bridge frame in the stack, RIP inside Dungeons.exe):
+//
+//     48 89 6C 24 10 / 48 89 74 24 18 / 57 / 48 83 EC 20    prologue of a small method (this, bool, bool)
+//     48 8B F9             mov  rdi,rcx                        ; this
+//     41 0F B6 F0          movzx esi,r8b
+//     48 8B 49 30          mov  rcx,[rcx+30h]                  ; <- access violation, read of 0x30, rcx (this) == NULL
+//     0F B6 EA             movzx ebp,dl
+//     48 85 C9             test rcx,rcx
+//     74 70                je   <epilogue>                     ; the game ALREADY handles a null member
+//
+// Same shape as rule 0 (a null pointer reaches a method that null-checks the member it loads but not the pointer
+// itself - again most likely the player/controller object that no longer exists once the local player is lost):
+// setting rcx = 0 and stepping over the 4-byte load takes exactly the branch the game wrote for "member is null",
+// which restores rbp/rsi from the frame and returns. It only acts on a read of 0x30 with rcx == 0 at a site that
+// matched the byte pattern at start-up.
+
+enum GuardReg { GR_RAX = 0, GR_RCX, GR_RDX, GR_RBX, GR_RSI, GR_RDI, GR_COUNT };
+
+struct GuardRule
+{
+    const char*    name;
+    const int16_t* pattern;      // -1 = wildcard; pattern[0] must be a real byte
+    size_t         patternLen;
+    size_t         faultOffset;  // the faulting instruction inside the pattern
+    size_t         instrLen;     // its length
+    uintptr_t      faultDisp;    // the address it must fault on (the member offset, base register being NULL)
+    GuardReg       baseReg;      // register that holds the NULL pointer
+    GuardReg       destReg;      // register the skipped load would have filled: set to 0
+};
+
+static const int16_t kGuardPatternTick[] = {
     0x33, 0xD2, 0x48, 0x8B, 0xCB, 0xE8, -1, -1, -1, -1,
     0x48, 0x8B, 0x98, 0xC8, 0x03, 0x00, 0x00, 0x48, 0x85, 0xDB, 0x74 };
-static const size_t kGuardPatternLen = sizeof(kGuardPattern) / sizeof(kGuardPattern[0]);
-static const size_t kGuardFaultOffset = 10;   // "mov rbx,[rax+3C8h]" inside the pattern
-static const size_t kGuardInstrLen = 7;       // its length
-static const uintptr_t kGuardFaultDisp = 0x3C8;
 
-// Pure: finds the pattern in [mem, mem+size); returns absolute addresses of the
-// faulting instruction (memBase + offset) - separate so it can be unit-tested.
-static size_t FindGuardSites(const uint8_t* mem, size_t size, uintptr_t memBase, uintptr_t* out, size_t maxOut)
+static const int16_t kGuardPatternNullThis[] = {
+    0x48, 0x89, 0x6C, 0x24, 0x10, 0x48, 0x89, 0x74, 0x24, 0x18, 0x57, 0x48, 0x83, 0xEC, 0x20,
+    0x48, 0x8B, 0xF9, 0x41, 0x0F, 0xB6, 0xF0, 0x48, 0x8B, 0x49, 0x30, 0x0F, 0xB6, 0xEA,
+    0x48, 0x85, 0xC9, 0x74, 0x70, 0x41, 0x0F, 0xB6, 0xD0, 0x48, 0x89, 0x5C, 0x24, 0x30,
+    0xE8, -1, -1, -1, -1, 0x48, 0x8B, 0xD8, 0x40, 0x84, 0xED, 0x74, 0x40,
+    0x83, 0xBF, 0x90, 0x00, 0x00, 0x00, 0x00, 0x7E, 0x37 };
+
+static const GuardRule kGuardRules[] = {
+    { "tick: GetPlayerController(..,0)->member @0x3C8", kGuardPatternTick,
+      sizeof(kGuardPatternTick) / sizeof(kGuardPatternTick[0]), 10, 7, 0x3C8, GR_RAX, GR_RBX },
+    { "null this: this->member @0x30", kGuardPatternNullThis,
+      sizeof(kGuardPatternNullThis) / sizeof(kGuardPatternNullThis[0]), 22, 4, 0x30, GR_RCX, GR_RCX },
+};
+static const int kGuardRuleCount = static_cast<int>(sizeof(kGuardRules) / sizeof(kGuardRules[0]));
+
+// Pure: finds one rule's pattern in [mem, mem+size); returns the absolute addresses of the faulting instruction
+// (memBase + offset) - separate so it can be unit-tested.
+static size_t FindGuardSites(const GuardRule& rule, const uint8_t* mem, size_t size, uintptr_t memBase,
+                             uintptr_t* out, size_t maxOut)
 {
     size_t n = 0;
-    if (size < kGuardPatternLen)
+    if (size < rule.patternLen)
         return 0;
-    for (size_t i = 0; i + kGuardPatternLen <= size && n < maxOut; ++i)
+    const uint8_t first = static_cast<uint8_t>(rule.pattern[0]);
+    for (size_t i = 0; i + rule.patternLen <= size && n < maxOut; ++i)
     {
-        if (mem[i] != 0x33)
+        if (mem[i] != first)
             continue;
         bool ok = true;
-        for (size_t j = 1; j < kGuardPatternLen; ++j)
+        for (size_t j = 1; j < rule.patternLen; ++j)
         {
-            const int16_t want = kGuardPattern[j];
+            const int16_t want = rule.pattern[j];
             if (want >= 0 && mem[i + j] != static_cast<uint8_t>(want)) { ok = false; break; }
         }
         if (ok)
-            out[n++] = memBase + i + kGuardFaultOffset;
+            out[n++] = memBase + i + rule.faultOffset;
     }
     return n;
 }
 
-// Pure decision, kept separate so it can be unit-tested.
-static bool GuardShouldRecover(bool enabled, DWORD code, uintptr_t faultRip, uint64_t readWrite,
-                               uint64_t faultAddr, uint64_t rax,
-                               const uintptr_t* sites, int siteCount)
+// Pure decision, kept separate so it can be unit-tested: the index of the rule to apply, or -1 to pass the
+// exception on untouched. regs is indexed by GuardReg.
+static int GuardMatch(bool enabled, DWORD code, uintptr_t faultRip, uint64_t readWrite, uint64_t faultAddr,
+                      const uint64_t* regs, const uintptr_t* sites, const int* siteRules, int siteCount)
 {
-    if (!enabled) return false;
-    if (code != EXCEPTION_ACCESS_VIOLATION) return false;
-    if (readWrite != 0 || faultAddr != kGuardFaultDisp || rax != 0) return false;
+    if (!enabled) return -1;
+    if (code != EXCEPTION_ACCESS_VIOLATION) return -1;
+    if (readWrite != 0) return -1;
     for (int i = 0; i < siteCount; ++i)
-        if (sites[i] == faultRip) return true;
-    return false;
+    {
+        if (sites[i] != faultRip)
+            continue;
+        const int ruleIdx = siteRules[i];
+        if (ruleIdx < 0 || ruleIdx >= kGuardRuleCount)
+            return -1;
+        const GuardRule& r = kGuardRules[ruleIdx];
+        if (faultAddr != r.faultDisp || regs[r.baseReg] != 0)
+            return -1;
+        return ruleIdx;
+    }
+    return -1;
+}
+
+// Pure: registers one hit at time `now` (ms). Starts a new window when the
+// current one has expired, otherwise counts inside it. Returns true when the
+// hits inside one window exceed `maxHits` (= a storm). Kept separate so it can
+// be unit-tested.
+static bool GuardStormUpdate(uint64_t now, uint64_t windowMs, uint32_t maxHits,
+                             uint64_t& windowStart, uint32_t& windowHits)
+{
+    if (windowHits == 0 || now < windowStart || now - windowStart > windowMs)
+    {
+        windowStart = now;
+        windowHits = 0;
+    }
+    ++windowHits;
+    return windowHits > maxHits;
 }
 
 static LONG CALLBACK CrashGuardVeh(PEXCEPTION_POINTERS info)
@@ -2678,35 +3720,646 @@ static LONG CALLBACK CrashGuardVeh(PEXCEPTION_POINTERS info)
         return EXCEPTION_CONTINUE_SEARCH;
 
     uintptr_t sites[GUARD_MAX_SITES];
+    int siteRules[GUARD_MAX_SITES];
     const int count = g_guardSiteCount.load(std::memory_order_acquire);
     for (int i = 0; i < count && i < GUARD_MAX_SITES; ++i)
+    {
         sites[i] = g_guardSites[i].load(std::memory_order_relaxed);
+        siteRules[i] = g_guardSiteRule[i].load(std::memory_order_relaxed);
+    }
 
     CONTEXT* c = info->ContextRecord;
     const uintptr_t rip = reinterpret_cast<uintptr_t>(er->ExceptionAddress);
-    if (!GuardShouldRecover(g_guardEnabled.load(std::memory_order_relaxed), er->ExceptionCode, rip,
-                            er->ExceptionInformation[0], er->ExceptionInformation[1], c->Rax,
-                            sites, count))
+    const uint64_t regs[GR_COUNT] = { c->Rax, c->Rcx, c->Rdx, c->Rbx, c->Rsi, c->Rdi };
+    const int rule = GuardMatch(g_guardEnabled.load(std::memory_order_relaxed), er->ExceptionCode, rip,
+                                er->ExceptionInformation[0], er->ExceptionInformation[1], regs,
+                                sites, siteRules, count);
+    if (rule < 0)
         return EXCEPTION_CONTINUE_SEARCH;
 
-    c->Rbx = 0;                 // "member is null" - the game's own jz handles it
-    c->Rip += kGuardInstrLen;   // step over "mov rbx,[rax+3C8h]"
+    // Storm check (atomics + GetTickCount64 only: no allocation, no locks, no file
+    // I/O). On a storm: disarm and pass the exception on untouched, so the game's
+    // own crash path (and our crash reporter, registered after us) takes over.
+    {
+        uint64_t ws = g_guardWindowStart.load(std::memory_order_relaxed);
+        uint32_t wh = g_guardWindowHits.load(std::memory_order_relaxed);
+        const bool storm = GuardStormUpdate(GetTickCount64(), GUARD_STORM_WINDOW_MS, GUARD_STORM_MAX_HITS, ws, wh);
+        g_guardWindowStart.store(ws, std::memory_order_relaxed);
+        g_guardWindowHits.store(wh, std::memory_order_relaxed);
+        if (storm)
+        {
+            g_guardStormTripped.store(true, std::memory_order_release);
+            g_guardEnabled.store(false, std::memory_order_relaxed);
+            g_guardLastRip.store(rip, std::memory_order_relaxed);
+            g_guardLastRule.store(rule, std::memory_order_relaxed);
+            CrumbAdd("GUARD_STORM", "storm breaker tripped - guard disarmed", rip, static_cast<uint64_t>(rule));
+            return EXCEPTION_CONTINUE_SEARCH;
+        }
+    }
+
+    const GuardRule& r = kGuardRules[rule];
+    switch (r.destReg)          // "member is null" - the game's own jz/je handles it
+    {
+    case GR_RAX: c->Rax = 0; break;
+    case GR_RCX: c->Rcx = 0; break;
+    case GR_RDX: c->Rdx = 0; break;
+    case GR_RBX: c->Rbx = 0; break;
+    case GR_RSI: c->Rsi = 0; break;
+    case GR_RDI: c->Rdi = 0; break;
+    default: return EXCEPTION_CONTINUE_SEARCH;
+    }
+    c->Rip += r.instrLen;       // step over the faulting load
     g_guardLastRip.store(rip, std::memory_order_relaxed);
+    g_guardLastRule.store(rule, std::memory_order_relaxed);
     g_guardHits.fetch_add(1, std::memory_order_relaxed);
+    CrumbAdd("GUARD", kGuardRules[rule].name, rip, static_cast<uint64_t>(rule));
+
+    // First hit of an episode (nothing dumped for a minute): freeze the flight recorder so the calls that led up
+    // to the lost player are kept. Atomics only - this runs inside the exception handler.
+    {
+        const ULONGLONG nowMs = GetTickCount64();
+        bool expected = false;
+        if (nowMs - g_frLastDumpMs.load(std::memory_order_relaxed) > 60000 &&
+            g_frFrozen.compare_exchange_strong(expected, true))
+        {
+            g_frFrozenHead.store(g_frHead.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            g_frFrozenTick.store(nowMs, std::memory_order_relaxed);
+        }
+    }
     return EXCEPTION_CONTINUE_EXECUTION;
 }
 
 // Reading a code section can't normally fault, but never let a scan take the
 // game down: POD-only helper so __try is allowed.
-static size_t ScanRegionSafe(uintptr_t start, size_t size, uintptr_t* out, size_t maxOut)
+static size_t ScanRegionSafe(int ruleIdx, uintptr_t start, size_t size, uintptr_t* out, size_t maxOut)
 {
     __try
     {
-        return FindGuardSites(reinterpret_cast<const uint8_t*>(start), size, start, out, maxOut);
+        return FindGuardSites(kGuardRules[ruleIdx], reinterpret_cast<const uint8_t*>(start), size, start, out, maxOut);
     }
     __except (EXCEPTION_EXECUTE_HANDLER)
     {
         return 0;
+    }
+}
+
+// Names (substrings) of functions that can take a local player away from the game.
+static const char* const kLocalPlayerLossNeedles[] = {
+    "RemovePlayer", "RemoveLocalPlayer", "HandleControllerConnectionChange", "HandleLocalPlayerLeave",
+    "OnUserSignedOut", "OnControllerConnectionChanged", "GetControllerDisconnectedMessage",
+    "ControllerDisconnect", "LocalPlayerLeave", "SignedOut",
+};
+
+static bool IsLocalPlayerLossName(const std::string& name)
+{
+    for (const char* needle : kLocalPlayerLossNeedles)
+        if (name.find(needle) != std::string::npos)
+            return true;
+    return false;
+}
+
+// Resolves and logs the frozen ring: how many calls / distinct functions, every suspect call, the busiest
+// functions, and the last 80 calls (oldest first, "-ms" = time before the freeze). Unfreezes at the end.
+static void DumpFlightRecorder()
+{
+    const uint32_t head = g_frFrozenHead.load(std::memory_order_relaxed);
+    const uint32_t count = head < FR_SIZE ? head : FR_SIZE;
+    const uint32_t frozenTick32 = static_cast<uint32_t>(g_frFrozenTick.load(std::memory_order_relaxed));
+
+    std::unordered_map<void*, std::string> names;
+    std::unordered_map<void*, uint32_t> counts;
+    auto nameOf = [&](void* fn) -> const std::string& {
+        auto it = names.find(fn);
+        if (it != names.end())
+            return it->second;
+        std::string n;
+        if (!TryGetObjectName(fn, n))
+            n = "?";
+        return names.emplace(fn, n).first->second;
+    };
+
+    for (uint32_t k = 0; k < count; ++k)
+    {
+        const FrEntry e = g_frRing[(head - count + k) & (FR_SIZE - 1)];
+        if (e.fn)
+            ++counts[e.fn];
+    }
+
+    {
+        std::ostringstream o;
+        o << "FLIGHT RECORDER: first guard hit of an episode - last " << count
+          << " ProcessEvent calls before it, " << counts.size() << " distinct functions.";
+        LogLine(o.str());
+    }
+
+    int suspectsLogged = 0;
+    for (uint32_t k = 0; k < count && suspectsLogged < 40; ++k)
+    {
+        const FrEntry e = g_frRing[(head - count + k) & (FR_SIZE - 1)];
+        if (!e.fn)
+            continue;
+        const std::string& fname = nameOf(e.fn);
+        if (!IsLocalPlayerLossName(fname))
+            continue;
+        std::string cls = "?";
+        TryGetClassName(e.self, cls);
+        std::ostringstream o;
+        o << "FLIGHT RECORDER:   SUSPECT -" << static_cast<uint32_t>(frozenTick32 - e.tick) << " ms ("
+          << (count - k) << " calls before the freeze): " << fname << " on " << cls;
+        LogLine(o.str());
+        ++suspectsLogged;
+    }
+    if (suspectsLogged == 0)
+        LogLine("FLIGHT RECORDER:   no local-player-removal function (RemovePlayer, HandleControllerConnectionChange, "
+                "HandleLocalPlayerLeave, OnUserSignedOut...) went through ProcessEvent in this window.");
+
+    // busiest functions in the window
+    std::vector<std::pair<uint32_t, void*>> busiest;
+    busiest.reserve(counts.size());
+    for (const auto& kv : counts)
+        busiest.emplace_back(kv.second, kv.first);
+    std::sort(busiest.begin(), busiest.end(),
+              [](const std::pair<uint32_t, void*>& a, const std::pair<uint32_t, void*>& b) { return a.first > b.first; });
+    for (size_t i = 0; i < busiest.size() && i < 12; ++i)
+    {
+        std::ostringstream o;
+        o << "FLIGHT RECORDER:   busiest #" << (i + 1) << ": " << busiest[i].first << " x " << nameOf(busiest[i].second);
+        LogLine(o.str());
+    }
+
+    // the last 80 calls, oldest first
+    const uint32_t tail = count < 80 ? count : 80;
+    for (uint32_t k = count - tail; k < count; ++k)
+    {
+        const FrEntry e = g_frRing[(head - count + k) & (FR_SIZE - 1)];
+        if (!e.fn)
+            continue;
+        std::string cls = "?";
+        TryGetClassName(e.self, cls);
+        std::ostringstream o;
+        o << "FLIGHT RECORDER:   -" << static_cast<uint32_t>(frozenTick32 - e.tick) << " ms  " << nameOf(e.fn)
+          << "  <- " << cls;
+        LogLine(o.str());
+    }
+
+    // what the client had asked for just before (oldest first), aged against the moment the recorder froze
+    {
+        const ULONGLONG frozenMs = g_frFrozenTick.load(std::memory_order_relaxed);
+        const uint32_t h = g_cmdHead.load(std::memory_order_relaxed);
+        const uint32_t cnt = h < 32 ? h : 32;
+        LogLine("FLIGHT RECORDER: last " + std::to_string(cnt) + " client command(s) (no get_* polls), oldest first:");
+        for (uint32_t k = 0; k < cnt; ++k)
+        {
+            const CmdNote n = g_cmdRing[(h - cnt + k) & 31];
+            if (!n.ms)
+                continue;
+            const long long age = static_cast<long long>(frozenMs) - static_cast<long long>(n.ms);
+            LogLine("FLIGHT RECORDER:   cmd " + (age >= 0 ? "-" + std::to_string(age) : "+" + std::to_string(-age)) +
+                    " ms  " + std::string(n.text));
+        }
+    }
+
+    g_frLastDumpMs.store(GetTickCount64(), std::memory_order_relaxed);
+    g_frFrozen.store(false, std::memory_order_release);   // recording resumes
+}
+
+// ---- Crash reporter (late part) ---------------------------------------------------------------------------------
+// A vectored exception handler, registered LAST (after the crash guard, which gets first pick of the access violations
+// it knows how to patch), that writes a self-contained report to dungeons_bridge_crash.log for every serious
+// first-chance exception nobody patched: exception code, faulting address as module+offset, registers, a stack walk as
+// module+offset lines, whether it happened inside one of OUR protected game calls (and which), and the breadcrumbs.
+// It never changes the outcome (always CONTINUE_SEARCH): the game's own crash reporter / our __try blocks still run.
+// A "first-chance" report with the game still running afterwards was caught by somebody's __try - harmless; the LAST
+// report before the game dies is the culprit. Everything here is allocation- and lock-free (static buffers, raw
+// WriteFile), so it works even when the crash is a heap or lock problem.
+static HANDLE g_crashFile = INVALID_HANDLE_VALUE;
+static std::atomic<uint32_t> g_crashReports{ 0 };
+static std::atomic<long> g_inCrashReporter{ 0 };
+
+static void CrashPrintf(const char* fmt, ...)
+{
+    if (g_crashFile == INVALID_HANDLE_VALUE)
+        return;
+    char buf[640];
+    va_list ap;
+    va_start(ap, fmt);
+    int n = _vsnprintf_s(buf, sizeof(buf), _TRUNCATE, fmt, ap);
+    va_end(ap);
+    if (n < 0)
+        n = static_cast<int>(strlen(buf));
+    DWORD written = 0;
+    WriteFile(g_crashFile, buf, static_cast<DWORD>(n), &written, nullptr);
+}
+
+static void DescribeAddress(uint64_t addr, char* out, size_t n)
+{
+    MEMORY_BASIC_INFORMATION mbi;
+    if (addr == 0 || !VirtualQuery(reinterpret_cast<LPCVOID>(addr), &mbi, sizeof(mbi)) || !mbi.AllocationBase)
+    {
+        _snprintf_s(out, n, _TRUNCATE, "0x%llx (unmapped)", static_cast<unsigned long long>(addr));
+        return;
+    }
+    const char* name = "?";
+    char path[MAX_PATH];
+    if (mbi.AllocationBase == g_ownModule)
+        name = "dungeons_bridge.dll";
+    else if (mbi.Type == MEM_IMAGE && GetModuleFileNameA(reinterpret_cast<HMODULE>(mbi.AllocationBase), path, MAX_PATH))
+    {
+        const char* slash = strrchr(path, '\\');
+        name = slash ? slash + 1 : path;
+    }
+    else
+        name = (mbi.Type == MEM_PRIVATE) ? "(heap/private memory)" : "(mapped memory)";
+    _snprintf_s(out, n, _TRUNCATE, "%s+0x%llx", name,
+                static_cast<unsigned long long>(addr - reinterpret_cast<uint64_t>(mbi.AllocationBase)));
+}
+
+static const char* ExceptionName(DWORD code)
+{
+    switch (code)
+    {
+    case EXCEPTION_ACCESS_VIOLATION:      return "ACCESS_VIOLATION";
+    case EXCEPTION_IN_PAGE_ERROR:         return "IN_PAGE_ERROR";
+    case EXCEPTION_STACK_OVERFLOW:        return "STACK_OVERFLOW";
+    case EXCEPTION_ILLEGAL_INSTRUCTION:   return "ILLEGAL_INSTRUCTION";
+    case EXCEPTION_PRIV_INSTRUCTION:      return "PRIV_INSTRUCTION";
+    case EXCEPTION_INT_DIVIDE_BY_ZERO:    return "INT_DIVIDE_BY_ZERO";
+    case EXCEPTION_ARRAY_BOUNDS_EXCEEDED: return "ARRAY_BOUNDS_EXCEEDED";
+    case 0xC0000374:                      return "HEAP_CORRUPTION";
+    case 0xC0000409:                      return "FAIL_FAST (stack buffer overrun / abort)";
+    default:                              return "?";
+    }
+}
+
+static int WalkStack(CONTEXT ctx, uint64_t* frames, int maxFrames)
+{
+    int n = 0;
+    for (; n < maxFrames; ++n)
+    {
+        const DWORD64 pc = ctx.Rip;
+        if (!pc)
+            break;
+        frames[n] = pc;
+        DWORD64 imageBase = 0;
+        PRUNTIME_FUNCTION fe = RtlLookupFunctionEntry(pc, &imageBase, nullptr);
+        if (!fe)
+        {
+            ctx.Rip = *reinterpret_cast<DWORD64*>(ctx.Rsp);   // leaf function: the return address is on top of the stack
+            ctx.Rsp += 8;
+        }
+        else
+        {
+            PVOID handlerData = nullptr;
+            DWORD64 establisher = 0;
+            RtlVirtualUnwind(UNW_FLAG_NHANDLER, imageBase, pc, fe, &ctx, &handlerData, &establisher, nullptr);
+        }
+        if (!ctx.Rsp)
+            break;
+    }
+    return n;
+}
+
+static void WriteCrashReport(PEXCEPTION_POINTERS info, uint32_t number)
+{
+    const EXCEPTION_RECORD* er = info->ExceptionRecord;
+    const CONTEXT* c = info->ContextRecord;
+    const DWORD tid = GetCurrentThreadId();
+    const bool ownCall = g_ownCallThreadId.load(std::memory_order_relaxed) == tid;
+    const bool stackOverflow = er->ExceptionCode == EXCEPTION_STACK_OVERFLOW;
+    char where[200];
+
+    CrashPrintf("\r\n==== CRASH REPORT #%u  build=%s  pid=%lu  uptime=%llus ====\r\n", number, kBuildId,
+                GetCurrentProcessId(), static_cast<unsigned long long>(GetTickCount64() / 1000));
+    CrashPrintf("exception 0x%08lX %s (first-chance: harmless if the game keeps running)\r\n",
+                er->ExceptionCode, ExceptionName(er->ExceptionCode));
+    if ((er->ExceptionCode == EXCEPTION_ACCESS_VIOLATION || er->ExceptionCode == EXCEPTION_IN_PAGE_ERROR) &&
+        er->NumberParameters >= 2)
+    {
+        const ULONG_PTR kind = er->ExceptionInformation[0];
+        CrashPrintf("access: %s of address 0x%llx\r\n", kind == 0 ? "READ" : kind == 1 ? "WRITE" : "EXECUTE (DEP)",
+                    static_cast<unsigned long long>(er->ExceptionInformation[1]));
+    }
+    DescribeAddress(reinterpret_cast<uint64_t>(er->ExceptionAddress), where, sizeof(where));
+    CrashPrintf("at: %s\r\n", where);
+    CrashPrintf("thread: %lu (%s)%s\r\n", tid,
+                tid == g_hookThreadId.load(std::memory_order_relaxed) ? "game/hook thread" : "other thread",
+                ownCall ? "  ** inside OUR protected game call - caught by our __try, the game continues **" : "");
+    if (ownCall && g_curCallObj.load(std::memory_order_relaxed))
+        CrashPrintf("our call: object=0x%llx function=0x%llx (see the CALL breadcrumb below for its name)\r\n",
+                    static_cast<unsigned long long>(g_curCallObj.load(std::memory_order_relaxed)),
+                    static_cast<unsigned long long>(g_curCallFunc.load(std::memory_order_relaxed)));
+    CrashPrintf("hook: silent=%d  guard hits=%llu\r\n", g_hookSilent.load(std::memory_order_relaxed) ? 1 : 0,
+                static_cast<unsigned long long>(g_guardHits.load(std::memory_order_relaxed)));
+    CrashPrintf("regs: RAX=%llx RBX=%llx RCX=%llx RDX=%llx RSI=%llx RDI=%llx RBP=%llx RSP=%llx\r\n",
+                c->Rax, c->Rbx, c->Rcx, c->Rdx, c->Rsi, c->Rdi, c->Rbp, c->Rsp);
+    CrashPrintf("      R8=%llx R9=%llx R10=%llx R11=%llx R12=%llx R13=%llx R14=%llx R15=%llx RIP=%llx\r\n",
+                c->R8, c->R9, c->R10, c->R11, c->R12, c->R13, c->R14, c->R15, c->Rip);
+
+    if (!stackOverflow)   // a stack walk needs stack, and an overflow has none left
+    {
+        uint64_t frames[24];
+        const int count = WalkStack(*c, frames, 24);
+        CrashPrintf("stack (%d frames):\r\n", count);
+        for (int i = 0; i < count; ++i)
+        {
+            DescribeAddress(frames[i], where, sizeof(where));
+            CrashPrintf("  #%02d %s\r\n", i, where);
+        }
+    }
+
+    const uint32_t head = g_crumbHead.load(std::memory_order_relaxed);
+    const uint32_t count = head < 40 ? head : 40;
+    const ULONGLONG now = GetTickCount64();
+    CrashPrintf("breadcrumbs (last %u, oldest first):\r\n", count);
+    for (uint32_t k = 0; k < count; ++k)
+    {
+        const Crumb& cr = g_crumbs[(head - count + k) & (CRUMB_SIZE - 1)];
+        CrashPrintf("  +%llums tid=%lu %s %s a=0x%llx b=0x%llx\r\n",
+                    static_cast<unsigned long long>(now >= cr.tick ? now - cr.tick : 0), cr.tid, cr.kind, cr.text,
+                    static_cast<unsigned long long>(cr.a), static_cast<unsigned long long>(cr.b));
+    }
+    CrashPrintf("==== END ====\r\n");
+    FlushFileBuffers(g_crashFile);
+}
+
+static LONG CALLBACK CrashReporterVeh(PEXCEPTION_POINTERS info)
+{
+    const DWORD code = info->ExceptionRecord->ExceptionCode;
+    switch (code)
+    {
+    case EXCEPTION_ACCESS_VIOLATION: case EXCEPTION_IN_PAGE_ERROR: case EXCEPTION_STACK_OVERFLOW:
+    case EXCEPTION_ILLEGAL_INSTRUCTION: case EXCEPTION_PRIV_INSTRUCTION: case EXCEPTION_INT_DIVIDE_BY_ZERO:
+    case EXCEPTION_ARRAY_BOUNDS_EXCEEDED: case 0xC0000374: case 0xC0000409:
+        break;
+    default:
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+    if (g_inCrashReporter.exchange(1) != 0)       // an exception inside the reporter itself: do nothing more
+        return EXCEPTION_CONTINUE_SEARCH;
+
+    // the same fault address twice within a second (a loop that keeps faulting and being caught) is written once
+    static std::atomic<uint64_t> lastAddr{ 0 };
+    static std::atomic<ULONGLONG> lastMs{ 0 };
+    const uint64_t addr = reinterpret_cast<uint64_t>(info->ExceptionRecord->ExceptionAddress);
+    const ULONGLONG nowMs = GetTickCount64();
+    const bool repeat = lastAddr.load(std::memory_order_relaxed) == addr && nowMs - lastMs.load(std::memory_order_relaxed) < 1000;
+    lastAddr.store(addr, std::memory_order_relaxed);
+    lastMs.store(nowMs, std::memory_order_relaxed);
+
+    if (!repeat && g_crashReports.load(std::memory_order_relaxed) < 80)
+    {
+        const uint32_t number = g_crashReports.fetch_add(1, std::memory_order_relaxed) + 1;
+        __try
+        {
+            WriteCrashReport(info, number);
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+        }
+    }
+    g_inCrashReporter.store(0);
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+
+static void InstallCrashReporter()
+{
+    std::string path = GetLogPath();
+    const size_t slash = path.find_last_of("\\/");
+    path = (slash == std::string::npos ? std::string() : path.substr(0, slash + 1)) + "dungeons_bridge_crash.log";
+    g_crashFile = CreateFileA(path.c_str(), FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
+                              OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (g_crashFile != INVALID_HANDLE_VALUE)
+        CrashPrintf("\r\n---- session start  build=%s  features=%s  pid=%lu ----\r\n", kBuildId, kFeatures,
+                    GetCurrentProcessId());
+    PVOID handle = AddVectoredExceptionHandler(0, CrashReporterVeh);   // 0 = AFTER the crash guard's handler
+    LogLine(std::string("CRASH REPORTER: build ") + kBuildId + ", features " + kFeatures +
+            (handle && g_crashFile != INVALID_HANDLE_VALUE ? ", armed (dungeons_bridge_crash.log)."
+                                                           : ", NOT fully armed (handler or log file failed)."));
+}
+
+// ---- Health watch (late part): freeze watchdog ----------------------------------------------------------------------
+// HealthSample() runs every 250 ms on the VoidController thread. It looks at three things:
+//   * the game thread: hkProcessEvent counts every ProcessEvent call the engine makes (dozens per frame). If the count
+//     stops moving for 2.5 s while the hook is active (and the game window is in front), the game thread is stuck.
+//     The first time, the watchdog snapshots WHERE every thread is (top frame, module+offset, thread name when the
+//     OS knows it) and the game thread's whole stack, and writes it as a HANG REPORT into dungeons_bridge_crash.log;
+//     it samples again after +8 s and +25 s so a loop can be told from a wait. A RenderThread sitting in a GPU/driver
+//     wait while the GameThread waits on it is what a black screen caused by the driver looks like.
+//   * our own game calls: one that runs for more than 1.5 s is reported while it is still running (OWNCALL_STUCK) -
+//     if that is the freeze, the culprit is named before the game even dies; slow ones (>= 150 ms) are reported
+//     afterwards (SLOW_CALL, from DrainPendingCalls).
+//   * a level transition (hook silent) that lasts more than 20 s (LONG_TRANSITION).
+// Threads are suspended only for the few microseconds a GetThreadContext takes; nothing is printed while one is.
+struct ThreadSnap { DWORD tid; uint64_t rip; uint64_t rsp; bool ok; };
+
+static int WalkStackGuarded(const CONTEXT& ctx, uint64_t* frames, int maxFrames)
+{
+    int n = 0;
+    __try
+    {
+        n = WalkStack(ctx, frames, maxFrames);
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+    }
+    return n;
+}
+
+static bool SnapshotThread(DWORD tid, CONTEXT* out)
+{
+    HANDLE h = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION, FALSE, tid);
+    if (!h)
+        return false;
+    bool ok = false;
+    if (SuspendThread(h) != static_cast<DWORD>(-1))
+    {
+        ZeroMemory(out, sizeof(*out));
+        out->ContextFlags = CONTEXT_CONTROL | CONTEXT_INTEGER;
+        ok = GetThreadContext(h, out) != FALSE;
+        ResumeThread(h);
+    }
+    CloseHandle(h);
+    return ok;
+}
+
+typedef HRESULT(WINAPI* GetThreadDescriptionFn)(HANDLE, PWSTR*);
+
+static void ThreadName(DWORD tid, char* out, size_t n)
+{
+    out[0] = 0;
+    static GetThreadDescriptionFn fn = reinterpret_cast<GetThreadDescriptionFn>(
+        GetProcAddress(GetModuleHandleA("kernelbase.dll"), "GetThreadDescription"));
+    if (!fn)
+        return;
+    HANDLE h = OpenThread(THREAD_QUERY_LIMITED_INFORMATION, FALSE, tid);
+    if (!h)
+        return;
+    PWSTR wide = nullptr;
+    if (SUCCEEDED(fn(h, &wide)) && wide)
+    {
+        WideCharToMultiByte(CP_UTF8, 0, wide, -1, out, static_cast<int>(n), nullptr, nullptr);
+        out[n - 1] = 0;
+        LocalFree(wide);
+    }
+    CloseHandle(h);
+}
+
+static void WriteHangSample(DWORD gameTid, ULONGLONG idleMs, bool foreground, int sampleNo)
+{
+    // 1. collect everything first (threads suspended one at a time, briefly, nothing printed meanwhile)
+    static ThreadSnap snaps[64];
+    int snapCount = 0;
+    CONTEXT gameCtx;
+    const bool haveGame = gameTid && SnapshotThread(gameTid, &gameCtx);
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+    if (snap != INVALID_HANDLE_VALUE)
+    {
+        THREADENTRY32 te;
+        te.dwSize = sizeof(te);
+        const DWORD pid = GetCurrentProcessId();
+        const DWORD self = GetCurrentThreadId();
+        for (BOOL more = Thread32First(snap, &te); more && snapCount < 64; more = Thread32Next(snap, &te))
+        {
+            if (te.th32OwnerProcessID != pid || te.th32ThreadID == self)
+                continue;
+            CONTEXT c;
+            ThreadSnap& t = snaps[snapCount++];
+            t.tid = te.th32ThreadID;
+            t.ok = SnapshotThread(t.tid, &c);
+            t.rip = t.ok ? c.Rip : 0;
+            t.rsp = t.ok ? c.Rsp : 0;
+        }
+        CloseHandle(snap);
+    }
+    uint64_t frames[24];
+    const int frameCount = haveGame ? WalkStackGuarded(gameCtx, frames, 24) : 0;
+
+    // 2. now write it
+    char where[200];
+    CrashPrintf("\r\n==== HANG REPORT sample %d  build=%s  pid=%lu  idle=%llums  foreground=%d ====\r\n", sampleNo, kBuildId,
+                GetCurrentProcessId(), static_cast<unsigned long long>(idleMs), foreground ? 1 : 0);
+    if (haveGame)
+    {
+        DescribeAddress(gameCtx.Rip, where, sizeof(where));
+        CrashPrintf("game thread %lu stuck at: %s\r\n", gameTid, where);
+        CrashPrintf("stack (%d frames):\r\n", frameCount);
+        for (int i = 0; i < frameCount; ++i)
+        {
+            DescribeAddress(frames[i], where, sizeof(where));
+            CrashPrintf("  #%02d %s\r\n", i, where);
+        }
+    }
+    else
+        CrashPrintf("game thread %lu: could not be read\r\n", gameTid);
+    const ULONGLONG callStart = g_curCallStartMs.load(std::memory_order_relaxed);
+    if (callStart)
+        CrashPrintf("our state: OUR game call '%s' has been running for %llu ms\r\n", g_curCallName,
+                    static_cast<unsigned long long>(GetTickCount64() - callStart));
+    else
+        CrashPrintf("our state: no game call of ours in progress; hook silent=%d\r\n",
+                    g_hookSilent.load(std::memory_order_relaxed) ? 1 : 0);
+    CrashPrintf("threads (top frame of each):\r\n");
+    for (int i = 0; i < snapCount; ++i)
+    {
+        char name[64];
+        ThreadName(snaps[i].tid, name, sizeof(name));
+        DescribeAddress(snaps[i].ok ? snaps[i].rip : 0, where, sizeof(where));
+        CrashPrintf("  tid=%lu \"%s\" %s\r\n", snaps[i].tid, name, snaps[i].ok ? where : "(unreadable)");
+    }
+    const uint32_t head = g_crumbHead.load(std::memory_order_relaxed);
+    const uint32_t count = head < 25 ? head : 25;
+    const ULONGLONG now = GetTickCount64();
+    CrashPrintf("breadcrumbs (last %u, oldest first):\r\n", count);
+    for (uint32_t k = 0; k < count; ++k)
+    {
+        const Crumb& cr = g_crumbs[(head - count + k) & (CRUMB_SIZE - 1)];
+        CrashPrintf("  +%llums tid=%lu %s %s a=0x%llx b=0x%llx\r\n",
+                    static_cast<unsigned long long>(now >= cr.tick ? now - cr.tick : 0), cr.tid, cr.kind, cr.text,
+                    static_cast<unsigned long long>(cr.a), static_cast<unsigned long long>(cr.b));
+    }
+    CrashPrintf("==== END ====\r\n");
+    FlushFileBuffers(g_crashFile);
+}
+
+static bool GameWindowIsForeground()
+{
+    DWORD pid = 0;
+    GetWindowThreadProcessId(GetForegroundWindow(), &pid);
+    return pid == GetCurrentProcessId();
+}
+
+static void HealthSample()
+{
+    static ULONGLONG nextMs = 0, lastChangeMs = 0, stallStartMs = 0, silentReported = 0;
+    static uint64_t lastCount = 0;
+    static int stallSamples = 0;
+    static bool ownCallReported = false;
+    const ULONGLONG now = GetTickCount64();
+    if (now < nextMs)
+        return;
+    nextMs = now + 250;
+
+    const uint64_t count = g_processEventCallCount.load(std::memory_order_relaxed);
+    const bool silent = g_hookSilent.load(std::memory_order_relaxed);
+    if (count != lastCount || silent || lastChangeMs == 0)
+    {
+        if (g_stalled.load(std::memory_order_relaxed) && !silent)
+        {
+            g_stalled.store(false, std::memory_order_relaxed);
+            HealthEventAdd("STALL_END", ("the game thread is running again after " +
+                                         std::to_string((now - stallStartMs) / 1000) + " s").c_str(), now - stallStartMs);
+        }
+        lastCount = count;
+        lastChangeMs = now;
+        stallSamples = 0;
+    }
+    g_lastPeChangeMs.store(lastChangeMs, std::memory_order_relaxed);
+
+    // 1. the game thread stopped
+    const bool foreground = GameWindowIsForeground();
+    const ULONGLONG idle = now - lastChangeMs;
+    const ULONGLONG threshold = foreground ? 2500 : 15000;   // an alt-tabbed game may legitimately idle
+    if (!silent && count > 0 && idle >= threshold)
+    {
+        if (!g_stalled.load(std::memory_order_relaxed))
+        {
+            g_stalled.store(true, std::memory_order_relaxed);
+            stallStartMs = lastChangeMs;
+            HealthEventAdd("STALL", ("the game thread stopped running ProcessEvent (" + std::string(foreground ? "window in front"
+                                      : "window in background") + ") - see HANG REPORT in dungeons_bridge_crash.log").c_str(), idle);
+        }
+        if ((stallSamples == 0 && idle >= threshold) || (stallSamples == 1 && idle >= threshold + 8000) ||
+            (stallSamples == 2 && idle >= threshold + 25000))
+        {
+            WriteHangSample(g_hookThreadId.load(std::memory_order_relaxed), idle, foreground, stallSamples + 1);
+            ++stallSamples;
+        }
+    }
+
+    // 2. one of OUR calls is taking too long right now
+    const ULONGLONG callStart = g_curCallStartMs.load(std::memory_order_relaxed);
+    if (callStart && now - callStart >= 1500)
+    {
+        if (!ownCallReported)
+        {
+            ownCallReported = true;
+            HealthEventAdd("OWNCALL_STUCK", (std::string("our game call '") + g_curCallName + "' has been running for " +
+                                             std::to_string((now - callStart) / 1000) + " s on the game thread").c_str(), now - callStart);
+        }
+    }
+    else if (!callStart)
+        ownCallReported = false;
+
+    // 3. a level transition that never ends
+    if (silent)
+    {
+        const ULONGLONG since = g_silentSince.load(std::memory_order_relaxed);
+        if (since && now - since >= 20000 && silentReported != since)
+        {
+            silentReported = since;
+            HealthEventAdd("LONG_TRANSITION", ("the hook has been silent (level loading) for " +
+                                               std::to_string((now - since) / 1000) + " s").c_str(), now - since);
+        }
     }
 }
 
@@ -2731,14 +4384,21 @@ static void InstallCrashGuard()
         return;
 
     uintptr_t found[GUARD_MAX_SITES];
+    int foundRule[GUARD_MAX_SITES];
     int total = 0;
-    PIMAGE_SECTION_HEADER sec = IMAGE_FIRST_SECTION(nt);
-    for (WORD i = 0; i < nt->FileHeader.NumberOfSections && total < GUARD_MAX_SITES; ++i, ++sec)
+    for (int ruleIdx = 0; ruleIdx < kGuardRuleCount; ++ruleIdx)
     {
-        if (!(sec->Characteristics & IMAGE_SCN_MEM_EXECUTE))
-            continue;
-        total += static_cast<int>(ScanRegionSafe(base + sec->VirtualAddress, sec->Misc.VirtualSize,
-                                                 found + total, GUARD_MAX_SITES - total));
+        PIMAGE_SECTION_HEADER sec = IMAGE_FIRST_SECTION(nt);
+        for (WORD i = 0; i < nt->FileHeader.NumberOfSections && total < GUARD_MAX_SITES; ++i, ++sec)
+        {
+            if (!(sec->Characteristics & IMAGE_SCN_MEM_EXECUTE))
+                continue;
+            const int before = total;
+            total += static_cast<int>(ScanRegionSafe(ruleIdx, base + sec->VirtualAddress, sec->Misc.VirtualSize,
+                                                     found + total, GUARD_MAX_SITES - total));
+            for (int k = before; k < total; ++k)
+                foundRule[k] = ruleIdx;
+        }
     }
 
     if (total == 0)
@@ -2749,8 +4409,10 @@ static void InstallCrashGuard()
     for (int i = 0; i < total; ++i)
     {
         g_guardSites[i].store(found[i], std::memory_order_relaxed);
+        g_guardSiteRule[i].store(foundRule[i], std::memory_order_relaxed);
         std::ostringstream o;
-        o << "CRASH GUARD: armed at Dungeons image + 0x" << std::hex << (found[i] - base);
+        o << "CRASH GUARD: armed at Dungeons image + 0x" << std::hex << (found[i] - base) << std::dec
+          << " (rule " << foundRule[i] << ": " << kGuardRules[foundRule[i]].name << ")";
         LogLine(o.str());
     }
     g_guardSiteCount.store(total, std::memory_order_release);
@@ -2767,9 +4429,12 @@ static void VoidControllerThread()
     LogLine("VoidController: started (mode=" + std::string(g_voidMode.load() == VOID_HARD ? "hard" : "soft") + ").");
     ULONGLONG nextHeartbeat = GetTickCount64() + 60000;
     uint32_t guardLogged = 0;
+    bool stormWarned = false;
+    bool stormReported = false;
     for (;;)
     {
         Sleep(20);
+        HealthSample();   // freeze / stuck-call / endless-transition watchdog (see "Health watch")
 
         // One line a minute: how long the game has been up / in the current
         // level. Two crashes happened ~15 min after a level load - this shows
@@ -2797,11 +4462,38 @@ static void VoidControllerThread()
                 std::ostringstream o;
                 o << "CRASH GUARD: recovered " << (hits - guardLogged) << " null-pointer read(s) at image + 0x"
                   << std::hex << (g_guardLastRip.load() - g_guardBase.load()) << std::dec
+                  << " (rule " << g_guardLastRule.load() << ")"
                   << " - game kept running. total=" << hits << ", in-level="
                   << (nowG - g_lastWorldChange.load()) / 60000.0 << " min, up="
                   << (nowG - g_dllStartTick.load()) / 60000.0 << " min, world=0x" << std::hex << g_lastSeenWorld.load();
                 LogLine(o.str());
                 guardLogged = hits;
+            }
+            if (g_frFrozen.load(std::memory_order_acquire))
+                DumpFlightRecorder();   // the VEH froze the flight recorder at the first hit of an episode
+        }
+
+        // Storm breaker reporting. The handler cannot log, so say it from here:
+        // a warning when a burst is building, then the verdict. The verdict line
+        // may be the last thing in the log - the game crashes right after.
+        {
+            const uint32_t wh = g_guardWindowHits.load();
+            const bool inWindow = (GetTickCount64() - g_guardWindowStart.load()) <= GUARD_STORM_WINDOW_MS;
+            if (!stormWarned && inWindow && wh >= GUARD_STORM_MAX_HITS / 2)
+            {
+                stormWarned = true;
+                LogLine("CRASH GUARD: hit storm building (" + std::to_string(wh) + " hits in <" +
+                        std::to_string(GUARD_STORM_WINDOW_MS) + " ms) - the game is probably stuck with no player controller.");
+            }
+            else if (stormWarned && !inWindow && !g_guardStormTripped.load())
+                stormWarned = false;   // burst ended on its own
+
+            if (g_guardStormTripped.load() && !stormReported)
+            {
+                stormReported = true;
+                LogLine("CRASH GUARD: STORM BREAKER TRIPPED - more than " + std::to_string(GUARD_STORM_MAX_HITS) +
+                        " hits in " + std::to_string(GUARD_STORM_WINDOW_MS) +
+                        " ms. Guard disarmed: letting the real crash happen instead of a black screen.");
             }
         }
 
@@ -2895,7 +4587,7 @@ static void WaitForEngineBoot()
 void SetupHookThread()
 {
     LogLine("=== SetupHookThread starting (new session) ===");
-    LogLine("BUILD: silence + safety patch, launch-parity guard v1 + boot-wait v2 + void controller v3 (soft/hard void during transitions)");
+    LogLine("BUILD: silence + safety patch, launch-parity guard v1 + boot-wait v2 + void controller v3 (soft/hard void during transitions) + crash guard rules (tick + null-this) + flight recorder v1 (black-screen investigation) + Eye of Ender pickup blocking + level gate v0 (trace + TryStart/TryContinue deny) + client command trace in the flight recorder + guard storm breaker (3 s / 15 hits)");
     struct SetupDone { ~SetupDone() { g_hookInstalled.store(true); } } setupDone;   // every exit path, incl. early returns
     // Small delay so classification/hooking doesn't start before the game's
     // own early init has had a chance to settle.
@@ -2914,6 +4606,7 @@ void SetupHookThread()
 #endif
     g_dllStartTick.store(GetTickCount64());
     WaitForEngineBoot();
+    InstallCrashReporter();   // before everything else that can fail: reports what the rest does wrong
     InstallCrashGuard();   // independent of the hook: works even if MinHook fails below
 
     MH_STATUS initStatus = MH_Initialize();

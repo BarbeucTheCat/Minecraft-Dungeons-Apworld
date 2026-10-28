@@ -84,3 +84,58 @@ class TestBonusChestCountExtremes(MCDungeonsTestBase):
     options = {
         "bonus_chest_count": 0,
     }
+
+
+class TestRequiredDlcsSubset(MCDungeonsTestBase):
+    """Only Hidden Depths is required: its missions may hold progression, every other enabled pack may not."""
+    options = {
+        "jungle_awakens_dlc": True, "creeping_winter_dlc": True, "howling_peaks_dlc": True,
+        "hidden_depths_dlc": True, "flames_of_the_nether_dlc": True, "echoing_void_dlc": True,
+        "dlc_missions_optional": False,
+        "required_dlcs": {"Hidden Depths"},
+        "dlc_boss_kill_checks": True,
+    }
+
+    def test_only_required_pack_is_progression(self):
+        from ..ZoneData import ZONES_BY_NAME
+        from BaseClasses import LocationProgressType
+        for loc in self.multiworld.get_locations(self.player):
+            region = loc.parent_region
+            zone = next((z for z in ZONES_BY_NAME.values() if z.display_name == region.name), None)
+            if not zone or zone.category != "dlc":
+                continue
+            if zone.dlc_pack == "hidden_depths_dlc":
+                continue
+            self.assertEqual(loc.progress_type, LocationProgressType.EXCLUDED, loc.name)
+
+
+class TestRequiredDlcsGoalPack(MCDungeonsTestBase):
+    """Goal in a DLC pack that is not listed: that pack is required anyway."""
+    options = {
+        "jungle_awakens_dlc": True, "hidden_depths_dlc": True,
+        "dlc_missions_optional": True,
+        "required_dlcs": {"Hidden Depths"},
+        "goal_mission": "overgrowntemple",
+    }
+
+
+class TestVillagersWithAncientHunts(MCDungeonsTestBase):
+    """Villager checks + Ancient Hunts: the Piglin Merchant check and item exist (and only then)."""
+    options = {"villager_checks": True, "ancient_hunts": True}
+
+    def test_piglin_check_and_item(self):
+        names = {loc.name for loc in self.multiworld.get_locations(self.player)}
+        self.assertIn("Ancient Hunts - Unlocked the Piglin Merchant", names)
+        self.assertIn("Highblock Halls - Rescued the Enchantsmith", names)
+        items = [i.name for i in self.multiworld.itempool if i.player == self.player]
+        self.assertEqual(1, items.count("Piglin Merchant"))
+
+
+class TestVillagersWithoutAncientHunts(MCDungeonsTestBase):
+    options = {"villager_checks": True, "ancient_hunts": False}
+
+    def test_no_piglin(self):
+        names = {loc.name for loc in self.multiworld.get_locations(self.player)}
+        self.assertNotIn("Ancient Hunts - Unlocked the Piglin Merchant", names)
+        items = [i.name for i in self.multiworld.itempool if i.player == self.player]
+        self.assertEqual(0, items.count("Piglin Merchant"))

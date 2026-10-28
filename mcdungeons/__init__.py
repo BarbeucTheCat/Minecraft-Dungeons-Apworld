@@ -10,7 +10,7 @@ How the files fit together:
                     DlcBossKillChecks, BonusChestCount, and DeathLink
     ZoneData.py   - the mission map itself: which mission unlocks which,
                     and which ones are hidden behind a secret exit
-    Items.py      - every item: each zone's Access item, Secret Access
+    Items.py      - every item: each zone's Access item, Secret Access (a secret zone uses only its Secret Access)
                     items, and all the filler
     Locations.py  - every location: one "Mission Complete" per zone;
                     an emerald milestone every 500 up to EmeraldGoal's
@@ -51,9 +51,9 @@ from worlds.LauncherComponents import Component, Type, components, launch_subpro
 from .Options import (
     MCDungeonsOptions, GoalMission, GOAL_MISSION_ID_TO_ZONE,
     JungleAwakensDLC, CreepingWinterDLC, HowlingPeaksDLC, HiddenDepthsDLC,
-    FlamesOfTheNetherDLC, EchoingVoidDLC, DlcMissionsOptional, DlcBossKillChecks,
+    FlamesOfTheNetherDLC, EchoingVoidDLC, DlcMissionsOptional, RequiredDlcs, DlcBossKillChecks, DlcMiniBossKillChecks,
 )
-from .Items import ITEM_TABLE, MISSION_ACCESS_ITEMS, SECRET_ACCESS_ITEMS, ANCIENT_HUNT_ACCESS_ITEM, FILLER_ITEMS, FILLER_ITEM_EMERALD_AMOUNTS, ITEM_REWARD_CATEGORIES, ITEM_REWARD_FILLERS, LOCATION_REWARD_ITEM_ZONE_CATEGORY, PROGRESSIVE_ENCHANT_SLOT_ITEM, PROGRESSIVE_ENCHANT_SLOT_COPIES, PROGRESSIVE_PICKUP_ITEM, PROGRESSIVE_PICKUP_COPIES, MCDungeonsItem
+from .Items import ITEM_TABLE, MISSION_ACCESS_ITEMS, SECRET_ACCESS_ITEMS, ANCIENT_HUNT_ACCESS_ITEM, FILLER_ITEMS, FILLER_ITEM_EMERALD_AMOUNTS, ITEM_REWARD_CATEGORIES, ITEM_REWARD_FILLERS, LOCATION_REWARD_ITEM_ZONE_CATEGORY, PROGRESSIVE_ENCHANT_SLOT_ITEM, PROGRESSIVE_ENCHANT_SLOT_COPIES, PROGRESSIVE_PICKUP_ITEM, PROGRESSIVE_PICKUP_COPIES, EYE_OF_ENDER_ITEM, EYE_OF_ENDER_COPIES, MCDungeonsItem, zone_access_item_name
 from .ZoneData import ZONES
 
 
@@ -95,9 +95,10 @@ components.append(
     )
 )
 from .Locations import (
-    LOCATION_TABLE, BOSS_KILL_TABLE, BOSS_ZONE,
+    LOCATION_TABLE, SECRET_PARENT_TO_ZONE, BOSS_KILL_TABLE, BOSS_ZONE,
     get_base_boss_names, get_dlc_boss_names,
     ANCIENT_HUNT_BOSS_KILL_TABLE,
+    wanted_mini_boss_zones, wanted_mini_boss_type_homes, EYE_OF_ENDER_TYPES, VILLAGER_TYPES,
     ZONE_CHEST_COUNTS, get_bonus_chest_locations,
 )
 from .ZoneData import ZONES, ANCIENT_HUNT_ZONES, ZONES_BY_NAME, full_predecessor_chain
@@ -112,8 +113,7 @@ class MCDungeonsWeb(WebWorld):
             "English",
             "setup_en.md",
             "setup/en",
-            ["FishTheCook"]  # matches archipelago.json's authors field -
-                              # confirm this is the intended credit name/handle
+            ["FishTheCook"]
         )
     ]
     theme = "stone"
@@ -127,7 +127,9 @@ class MCDungeonsWeb(WebWorld):
             FlamesOfTheNetherDLC,
             EchoingVoidDLC,
             DlcMissionsOptional,
+            RequiredDlcs,
             DlcBossKillChecks,
+            DlcMiniBossKillChecks,
         ]),
     ]
 
@@ -194,11 +196,9 @@ class MCDungeonsWorld(World):
             require_secret_option = bool(self.options.secret_missions_require_secret)
             for ancestor_name in chain:
                 ancestor = ZONES_BY_NAME[ancestor_name]
-                access_item = f"{ancestor.display_name} Access"
+                # ONE item per zone (a secret zone's is its Secret Access, see Items.zone_access_item_name)
+                access_item = zone_access_item_name(ancestor, require_secret_option)
                 self.multiworld.early_items[self.player][access_item] = 1
-                if ancestor.secret and require_secret_option:
-                    secret_item = f"{ancestor.display_name} Secret Access"
-                    self.multiworld.early_items[self.player][secret_item] = 1
 
         if not self.options.emerald_mode.goal_enabled and goal_mission_id == GoalMission.option_none:
             raise OptionError(
@@ -247,10 +247,11 @@ class MCDungeonsWorld(World):
             # there'd be two copies: one you already have, and one
             # placed somewhere random. That would put one more item in
             # the pool than there are locations to hold it.
+            # ONE access item per zone: a secret zone's is its Secret Access when the option is on
+            # (its plain Access is then not in the pool at all), every other zone's is its Access.
             if zone.internal_name != "squidcoast":
-                pool.append(self.create_item(f"{zone.display_name} Access"))
-            if zone.secret and bool(self.options.secret_missions_require_secret):
-                pool.append(self.create_item(f"{zone.display_name} Secret Access"))
+                pool.append(self.create_item(
+                    zone_access_item_name(zone, bool(self.options.secret_missions_require_secret))))
 
         if self.options.ancient_hunts:
             pool.append(self.create_item(ANCIENT_HUNT_ACCESS_ITEM))
@@ -263,6 +264,22 @@ class MCDungeonsWorld(World):
         # num_slots on every give_random_item/give_location_reward call.
         for _ in range(PROGRESSIVE_ENCHANT_SLOT_COPIES):
             pool.append(self.create_item(PROGRESSIVE_ENCHANT_SLOT_ITEM))
+
+        # Eye of Ender items: the six keys The Stronghold needs when the eye_of_ender_checks option is on
+        # (one location per Eye type lives in Regions.py; this is their matching items).
+        if self.options.eye_of_ender_checks:
+            for _ in range(EYE_OF_ENDER_COPIES):
+                pool.append(self.create_item(EYE_OF_ENDER_ITEM))
+
+        # Villager items: one camp merchant per captured villager whose mission is in the seed (the matching
+        # locations are added in Regions.py, only for enabled zones too, so the counts always agree).
+        if self.options.villager_checks:
+            enabled_zone_names_for_villagers = {z.internal_name for z in enabled_zones}
+            if self.options.ancient_hunts:      # the Piglin Merchant check lives in an Ancient Hunt
+                enabled_zone_names_for_villagers |= {z.internal_name for z in ANCIENT_HUNT_ZONES}
+            for _key, _fragment, villager_display, villager_zone in VILLAGER_TYPES:
+                if villager_zone in enabled_zone_names_for_villagers:
+                    pool.append(self.create_item(villager_display))
 
         # Progressive pickup unlock - only if the option is actually on;
         # previously this option existed but placed no item at all, so
@@ -317,6 +334,29 @@ class MCDungeonsWorld(World):
                 if zone_internal_name in enabled_zone_names:
                     boss_kill_location_count += 1
 
+        mini_boss_kill_location_count = 0
+        if self.options.mini_boss_kill_checks.value or self.options.dlc_mini_boss_kill_checks.value:
+            enabled_zone_names_for_mini_bosses = {z.internal_name for z in enabled_zones}
+            mb_base, mb_dlc = self.options.mini_boss_kill_checks.value, self.options.dlc_mini_boss_kill_checks.value
+            mini_boss_kill_location_count = (
+                len(wanted_mini_boss_zones(mb_base, mb_dlc) & enabled_zone_names_for_mini_bosses)   # per_zone checks
+                + len(wanted_mini_boss_type_homes(mb_base, mb_dlc, enabled_zone_names_for_mini_bosses))   # per_type checks
+            )
+
+        eye_of_ender_location_count = 0
+        if self.options.eye_of_ender_checks:
+            enabled_zone_names_for_eyes = {z.internal_name for z in enabled_zones}
+            eye_of_ender_location_count = sum(1 for _t, _m, zone_name in EYE_OF_ENDER_TYPES
+                                              if zone_name in enabled_zone_names_for_eyes)
+
+        villager_location_count = 0
+        if self.options.villager_checks:
+            enabled_zone_names_for_villager_checks = {z.internal_name for z in enabled_zones}
+            if self.options.ancient_hunts:
+                enabled_zone_names_for_villager_checks |= {z.internal_name for z in ANCIENT_HUNT_ZONES}
+            villager_location_count = sum(1 for _k, _f, _d, zone_name in VILLAGER_TYPES
+                                          if zone_name in enabled_zone_names_for_villager_checks)
+
         ancient_hunt_boss_kill_count = (
             len(ANCIENT_HUNT_ZONES)
             if self.options.ancient_hunts and self.options.ancient_hunt_boss_checks
@@ -350,12 +390,24 @@ class MCDungeonsWorld(World):
         if self.options.goal_mission.value != GoalMission.option_none:
             victory_event_location_count += 1
 
+        # "Secret Zone Found" locations (Regions.py): one per secret zone whose
+        # parent AND itself are enabled, only with Secret Mission Access on.
+        secret_zone_found_location_count = 0
+        if self.options.secret_missions_require_secret:
+            for parent_name, secret_name in SECRET_PARENT_TO_ZONE.items():
+                if parent_name in enabled_zone_names_for_chests and secret_name in enabled_zone_names_for_chests:
+                    secret_zone_found_location_count += 1
+
         location_count = (
             len(enabled_zones)
+            + secret_zone_found_location_count
             + (len(ANCIENT_HUNT_ZONES) if self.options.ancient_hunts else 0)
             + ancient_hunt_boss_kill_count
             + emerald_milestone_count
             + boss_kill_location_count
+            + mini_boss_kill_location_count
+            + eye_of_ender_location_count
+            + villager_location_count
             + zone_chest_location_count
             + bonus_chest_location_count
             - victory_event_location_count
@@ -383,8 +435,22 @@ class MCDungeonsWorld(World):
 
         self.multiworld.itempool += pool
 
+    @classmethod
+    def _apworld_version(cls) -> str:
+        """Version of this apworld, read from its archipelago.json manifest.
+        Archipelago 0.6.8+ exposes it as World.world_version / World.manifest; older
+        versions don't, so everything is read defensively."""
+        version = getattr(cls, "world_version", None)
+        if version is not None and tuple(version) != (0, 0, 0):
+            return ".".join(str(part) for part in version)
+        manifest = getattr(cls, "manifest", None) or {}
+        return str(manifest.get("world_version", "unknown"))
+
     def fill_slot_data(self) -> Dict[str, object]:
         return {
+            # Lets the client warn when the seed was generated with a different apworld version.
+            "world_version": self._apworld_version(),
+            "game_store": self.options.game_store.store_key,
             "jungle_awakens_dlc": bool(self.options.jungle_awakens_dlc),
             "creeping_winter_dlc": bool(self.options.creeping_winter_dlc),
             "howling_peaks_dlc": bool(self.options.howling_peaks_dlc),
@@ -404,7 +470,13 @@ class MCDungeonsWorld(World):
             ),
             "boss_kill_checks": bool(self.options.boss_kill_checks),
             "dlc_boss_kill_checks": bool(self.options.dlc_boss_kill_checks),
+            "mini_boss_kill_checks": self.options.mini_boss_kill_checks.value,          # 0 none, 1 per_type, 2 per_zone, 3 both
+            "eye_of_ender_checks": bool(self.options.eye_of_ender_checks),
+            "villager_checks": bool(self.options.villager_checks),
+            "dlc_mini_boss_kill_checks": self.options.dlc_mini_boss_kill_checks.value,  # same values, DLC zones
             "progressive_pickups": bool(self.options.progressive_pickups),
             "bonus_chest_count": self.options.bonus_chest_count.value,
             "death_link": bool(self.options.death_link),
+            # DLC packs whose checks never hold progression items (client map: yellow instead of green)
+            "optional_dlc_packs": list(getattr(self, "optional_dlc_packs", [])),
         }
