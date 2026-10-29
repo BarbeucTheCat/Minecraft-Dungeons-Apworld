@@ -10,7 +10,7 @@ Each ZoneInfo entry:
     requires:       which mission(s) you need first. More than one
                        means you need ALL of them. Empty means no
                        predecessor.
-    secret:         Make a secret mission different from a normal mission
+    secret:         Make secret mission differant than a normal mission
                        allow to make there access item in the option
     min_difficulty: "I" through "V" Not used, doesn't
                        affect logic here
@@ -24,7 +24,7 @@ from typing import List, Optional
 class ZoneInfo:
     internal_name: str
     display_name: str
-    category: str  # "base" | "dlc"
+    category: str  # "base" or "dlc"
     requires: List[str] = field(default_factory=list)
     secret: bool = False
     min_difficulty: str = "I"
@@ -48,6 +48,7 @@ ZONES: List[ZoneInfo] = [
     ZoneInfo("highblockhalls", "Highblock Halls", "base", ["deserttemple", "fieryforge"], False, "IV"),
     ZoneInfo("underhalls", "Underhalls", "base", ["highblockhalls"], True, "V"),
     ZoneInfo("obsidianpinnacle", "Obsidian Pinnacle", "base", ["highblockhalls"], False, "IV"),
+    ZoneInfo("thestronghold", "The Stronghold", "base", ["obsidianpinnacle"], False, "III"),
     ZoneInfo(
         "mooshroomisland", "??? (Mooshroom Island)", "base",
         [
@@ -58,8 +59,7 @@ ZONES: List[ZoneInfo] = [
         False, "IV",
     ),
 
-    #Echoing Void (Stronghold is a Mainland Mission)
-    ZoneInfo("thestronghold", "The Stronghold", "base", ["obsidianpinnacle"], False, "III"),
+    #Echoing Void
     ZoneInfo("enderwilds", "End Wilds", "dlc", ["thestronghold"], False, "II", dlc_pack="echoing_void_dlc"),
     ZoneInfo("endcitadel_blightedcitadel", "Broken Citadel", "dlc", ["enderwilds"], False, "IV", dlc_pack="echoing_void_dlc"),
 
@@ -94,7 +94,7 @@ ZONES: List[ZoneInfo] = [
     ZoneInfo("netherfortress", "Nether Fortress", "dlc", ["basaltdeltas"], True, "I", dlc_pack="flames_of_the_nether_dlc"),
 ]
 
-# Ancient Hunts: no predecessor, gated by an item instead (see Rules.py).
+# Ancient Hunts: gated by an item instead (see Rules.py).
 ANCIENT_HUNT_ZONES: List[ZoneInfo] = [
     ZoneInfo("hm_woodlandmansion", "Woodland Mansion", "base", [], False, "I"),
     ZoneInfo("hm_woodlandprison", "Woodland Prison", "base", [], False, "I"),
@@ -107,7 +107,7 @@ ZONES_BY_NAME = {z.internal_name: z for z in ZONES}
 
 
 def skip_level_requires_map(enabled_names=None):
-    """The logic for mission unlock (look at the parent mission and its grandparent)"""
+    """The logic for mission unlock (look at the parents mission and it's grands parrent)"""
     names = enabled_names if enabled_names is not None else set(ZONES_BY_NAME)
     result = {}
     for name, zone in ZONES_BY_NAME.items():
@@ -147,3 +147,4 @@ def full_predecessor_chain(zone_name, enabled_names=None):
 
     visit(zone_name)
     return order
+ 
