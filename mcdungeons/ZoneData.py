@@ -1,19 +1,13 @@
 """
-The mission logic for Minecraft Dungeons.
+ZoneInfo entries describe each mission in the game.
 
-Each ZoneInfo entry:
-    internal_name:  the internal name of the mission, matching
-                       the game's own memory and zone_name_lookup.json
-    display_name:   the name you actually see in game
-    category:       "base" or "dlc"
-    dlc_pack:       which Options controls this zone
-    requires:       which mission(s) you need first. More than one
-                       means you need ALL of them. Empty means no
-                       predecessor.
-    secret:         Make secret mission differant than a normal mission
-                       allow to make there access item in the option
-    min_difficulty: "I" through "V" Not used, doesn't
-                       affect logic here
+internal_name:  matches the game's memory (see zone_name_lookup.json)
+display_name:   what the player sees in game
+category:       "base" or "dlc"
+dlc_pack:       which option gates this zone
+requires:       predecessor missions; multiple means ALL are needed, empty means none
+secret:         marks a secret mission (enables the Secret Access item option)
+min_difficulty: not used here; doesn't affect logic   
 """
 
 from dataclasses import dataclass, field
@@ -30,7 +24,7 @@ class ZoneInfo:
     min_difficulty: str = "I"
     dlc_pack: Optional[str] = None  # matches the Options.py name
 
-
+# Append-only: the order decides item and location IDs.
 ZONES: List[ZoneInfo] = [
     #Mainland (base game)
     ZoneInfo("squidcoast", "Squid Coast", "base", [], False, "I"),
@@ -48,7 +42,6 @@ ZONES: List[ZoneInfo] = [
     ZoneInfo("highblockhalls", "Highblock Halls", "base", ["deserttemple", "fieryforge"], False, "IV"),
     ZoneInfo("underhalls", "Underhalls", "base", ["highblockhalls"], True, "V"),
     ZoneInfo("obsidianpinnacle", "Obsidian Pinnacle", "base", ["highblockhalls"], False, "IV"),
-    ZoneInfo("thestronghold", "The Stronghold", "base", ["obsidianpinnacle"], False, "III"),
     ZoneInfo(
         "mooshroomisland", "??? (Mooshroom Island)", "base",
         [
@@ -58,6 +51,7 @@ ZONES: List[ZoneInfo] = [
         ],
         False, "IV",
     ),
+    ZoneInfo("thestronghold", "The Stronghold", "base", ["obsidianpinnacle"], False, "III"),
 
     #Echoing Void
     ZoneInfo("enderwilds", "End Wilds", "dlc", ["thestronghold"], False, "II", dlc_pack="echoing_void_dlc"),
@@ -107,7 +101,7 @@ ZONES_BY_NAME = {z.internal_name: z for z in ZONES}
 
 
 def skip_level_requires_map(enabled_names=None):
-    """The logic for mission unlock (look at the parents mission and it's grands parrent)"""
+    """The logic for mission unlock (look at the parent mission and its grandparent)."""   
     names = enabled_names if enabled_names is not None else set(ZONES_BY_NAME)
     result = {}
     for name, zone in ZONES_BY_NAME.items():
@@ -127,9 +121,7 @@ def skip_level_requires_map(enabled_names=None):
 
 
 def full_predecessor_chain(zone_name, enabled_names=None):
-    """Maps each zone to its closest ancestors internal_names (parent +
-    grandparent tier and add it together)
-    """
+    """Returns the full list of ancestor internal_names for a zone (all predecessors, not just one level up)."""   
     names = enabled_names if enabled_names is not None else set(ZONES_BY_NAME)
     seen: set = set()
     order: List[str] = []

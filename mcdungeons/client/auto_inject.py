@@ -1,31 +1,20 @@
-"""
-Auto-injector for dungeons_bridge.dll - replaces the manual "use an
-external injector tool" step from earlier in this project.
-
-Uses the classic, well-known technique (the same one UUU and Cheat Engine
-use internally): OpenProcess -> VirtualAllocEx -> WriteProcessMemory ->
-CreateRemoteThread(LoadLibraryA). LoadLibraryA's address is safe to grab
-from our own process, since kernel32.dll loads at the same base address
-across all processes for a given boot session.
-
-Heads up: some antivirus/Defender configurations flag CreateRemoteThread
-injection heuristically, since it's the same primitive used by malware -
-this is a common false-positive source for legitimate tools too (game
-trainers, overlays, mod loaders all use this). If Defender blocks it,
-you may need an exclusion for this folder.
-
-pip install pywin32
-"""
+"""Auto-injects dungeons_bridge.dll into the game process (replaces the manual injector step).
+    OpenProcess: get a handle to the game process.
+    VirtualAllocEx: allocate memory inside the game.
+    WriteProcessMemory: write the DLL path into that memory.
+    CreateRemoteThread(LoadLibraryA): ask the game to load the DLL from that address.
+    LoadLibraryA's address is safe to grab from our own process: kernel32.dll loads at the
+    same base address across all processes for a given boot session.
+    Defender may flag it (same primitive as malware); add a folder exclusion if it does.
+    Requires: pip install pywin32"""
 
 import ctypes
 from ctypes import wintypes
 import os
 import time
 
-PROCESS_NAME = "Dungeons.exe"  # standalone-CLI fallback only. The real name depends on the store
-                               # (Steam: "Dungeons-Win64-Shipping.exe") and lives in
-                               # dungeons_reader.STORE_PROCESS_NAMES / dungeons_reader.PROCESS_NAME;
-                               # the CLI below asks dungeons_reader first (see _cli_process_name).
+PROCESS_NAME = "Dungeons.exe"  # CLI fallback only. The real process name is store-dependent and lives in dungeons_reader
+                               # (STORE_PROCESS_NAMES / PROCESS_NAME); the CLI asks dungeons_reader first (_cli_process_name).
 
 
 def _cli_process_name():
@@ -47,11 +36,8 @@ TH32CS_SNAPMODULE32 = 0x00000010
 
 kernel32 = ctypes.windll.kernel32
 
-# ctypes defaults every argument to a 32-bit int unless told otherwise -
-# on 64-bit Windows that SILENTLY TRUNCATES handles/pointers/sizes, which
-# is exactly what caused WriteProcessMemory to fail even though
-# OpenProcess and VirtualAllocEx both "succeeded" first. Declaring the
-# real types below is what fixes it.
+# ctypes defaults args to 32-bit int; on 64-bit Windows that silently truncates handles/pointers/sizes
+# (caused WriteProcessMemory to fail). Declaring real argtypes below fixes it.
 kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
 kernel32.OpenProcess.restype = wintypes.HANDLE
 
@@ -140,21 +126,13 @@ class MODULEENTRY32(ctypes.Structure):
 
 INVALID_HANDLE_VALUE = 0xFFFFFFFFFFFFFFFF
 
-# The one Win32 error code this module cares about specifically: every
-# other failure mode (bad path, wrong architecture, process gone) gets a
-# generic RuntimeError, but ERROR_ACCESS_DENIED means the OS itself is
-# refusing the handle/rights we asked for - a fundamentally different
-# problem (permissions/isolation, not a bug in this script) that deserves
-# its own exception type and its own actionable message. See
-# InjectionAccessDeniedError below.
+# ERROR_ACCESS_DENIED gets its own exception type (InjectionAccessDeniedError) because it's a
+# permissions/isolation problem, not a bug in this script. All other failures are generic RuntimeError.
 ERROR_ACCESS_DENIED = 5
 
-# PROCESS_ALL_ACCESS itself needs no special rights to REQUEST, only to be
-# GRANTED - so a cheap way to check "is this PID reachable at all for a
-# lesser purpose" without re-triggering the same access-denied path is to
-# retry with PROCESS_QUERY_LIMITED_INFORMATION, which almost nothing
-# refuses. Used only for diagnostics (identifying the exe path) after a
-# real injection attempt has already failed - never in the main path.
+# PROCESS_ALL_ACCESS can be denied without any special rights missing; PROCESS_QUERY_LIMITED_INFORMATION
+# is almost never refused, so it's a cheap diagnostic probe (exe path) after a real injection failure —
+# never used in the main path.
 PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
 _DIAGNOSTIC_QUERY_ACCESS = PROCESS_QUERY_LIMITED_INFORMATION
 
@@ -164,30 +142,11 @@ def _is_invalid_handle(h):
 
 
 class InjectionAccessDeniedError(RuntimeError):
-    """Raised instead of a plain RuntimeError specifically when Windows
-    refused a handle or memory operation with ERROR_ACCESS_DENIED (5),
-    at any step of inject_dll - OpenProcess, VirtualAllocEx,
-    WriteProcessMemory, or CreateRemoteThread can all fail this way.
-
-    Kept as its own type (rather than just a distinctly-worded
-    RuntimeError) so callers upstream (dungeons_ap_client.py's launch
-    flow, the Launcher component) can catch this specifically and show a
-    permissions-focused message instead of the generic "injection
-    failed, check your setup" one - the fix for an access-denied refusal
-    (run as admin, check antivirus, check for a protected/Store install)
-    is completely different from the fix for e.g. a missing DLL file.
-
-    step: which call in inject_dll refused access (e.g. "OpenProcess",
-    "WriteProcessMemory") - included in the message so a bug report or
-    log line pinpoints exactly where without needing the full traceback.
-    likely_protected_path: the target process's own exe path, if it was
-    possible to retrieve one via a lesser-privileged diagnostic query
-    after the real attempt failed - None if even that query didn't work
-    (which can itself happen against a sufficiently locked-down/protected
-    process). Surfaced separately from the message text so a caller can
-    decide whether to show it, log it, or match on it (e.g. detecting
-    "\\WindowsApps\\" to recognize a Microsoft Store install specifically)."""
-
+    """Raised when Windows refuses a handle/memory operation with ERROR_ACCESS_DENIED (5) at any step of inject_dll.
+    Separate type so callers can show a permissions-specific message (run as admin, check AV, Store install)
+    instead of the generic "injection failed" one.
+    step: which call was refused ("OpenProcess", "WriteProcessMemory", ...).
+    likely_protected_path: target exe path if retrievable (None if not) — e.g. to detect "\\WindowsApps\\"."""
     def __init__(self, step: str, pid: int, likely_protected_path: "str | None" = None):
         self.step = step
         self.pid = pid
@@ -197,18 +156,14 @@ class InjectionAccessDeniedError(RuntimeError):
             f"\n  Target executable: {likely_protected_path}"
             if likely_protected_path else
             "\n  (couldn't even determine the target's exe path with reduced rights - "
-            "the process is likely running under extra isolation, e.g. an AppContainer.)"
+            "the process is likely running under extra isolation, e.g. an AppContainer.)" 
         )
         store_hint = ""
         if likely_protected_path and "windowsapps" in likely_protected_path.lower():
             store_hint = (
-                "\n  This looks like a Microsoft Store install (path is under "
-                "WindowsApps) - those run sandboxed (AppContainer) with locked-down "
-                "ACLs (even Administrators can't normally read/write files there, let "
-                "alone open the running process for memory access), which is a much "
-                "harder blocker than a normal permissions issue and may not be fixable "
-                "by running as admin at all. If you have the option, the Steam version "
-                "of this game is the confirmed-working target for injection."
+            "\n This looks like a Microsoft Store install (path under WindowsApps) — those run sandboxed (AppContainer)\n"
+            "with locked-down ACLs; even Administrators may not be able to open the process for memory access.\n"
+            "If injection fails here, running as admin may not fix it."
             )
 
         super().__init__(
@@ -226,14 +181,9 @@ class InjectionAccessDeniedError(RuntimeError):
 
 
 def _try_get_process_image_path(pid) -> "str | None":
-    """Best-effort only - used purely to enrich InjectionAccessDeniedError's
-    message after a real injection attempt already failed. Uses the
-    lightest-weight access right that can still retrieve a path
-    (PROCESS_QUERY_LIMITED_INFORMATION), since asking for anything more
-    against a process we already know just refused us would just fail the
-    same way again. Returns None on ANY failure - never raises, since this
-    is diagnostic sugar, not something that should mask or replace the
-    original error."""
+    """Best-effort: retrieves the target exe path after a real injection failure, to enrich the error message.
+    Uses PROCESS_QUERY_LIMITED_INFORMATION (lightest right that can read a path).
+    Returns None on any failure — never raises."""
     handle = kernel32.OpenProcess(_DIAGNOSTIC_QUERY_ACCESS, False, pid)
     if _is_invalid_handle(handle):
         return None
@@ -271,16 +221,9 @@ def find_process_id(process_name):
 
 
 def find_all_process_ids(process_name):
-    """Same enumeration as find_process_id, but collects EVERY matching
-    PID instead of stopping at the first - needed to even notice that
-    more than one Dungeons.exe is running at once. find_process_id (and
-    a bare pymem.Pymem(process_name)) both silently return just the
-    first match in Process32First/Next order, which is fine with one
-    game running but means, with two, every client process launched
-    keeps attaching to that SAME first process - the second game
-    instance never gets a client (or the DLL) at all, no error, just
-    quietly nothing happening for player 2. Returns a list of PIDs, in
-    enumeration order (empty if none found)."""
+    """Returns ALL PIDs matching the process name (find_process_id only returns the first).
+    Needed because with two game instances running, the second silently never gets a client attached.
+    Returns a list in enumeration order (empty if none found)."""
     snapshot = kernel32.CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
     if _is_invalid_handle(snapshot):
         return []
@@ -307,19 +250,9 @@ kernel32.GetExitCodeProcess.restype = wintypes.BOOL
 
 
 def is_process_alive(pid):
-    """True only if a process with this PID both exists AND is still
-    running (not just "some process happens to have reused this PID" -
-    GetExitCodeProcess on a handle actually opened for THIS pid is what
-    makes that distinction, a plain "does OpenProcess succeed" check
-    alone can't). Used by the client to notice a game crash/relaunch -
-    Dungeons.exe closing invalidates the pymem handle the game_watcher
-    tick loop was reading through, but every read this loop does is
-    already wrapped in a broad try/except that just `continue`s, so
-    nothing else would ever surface that as an error - checks would
-    simply stop being sent forever until the client itself was
-    restarted. Returns False for a PID that no longer exists (OpenProcess
-    fails) or one that exists but has exited (GetExitCodeProcess reports
-    anything other than STILL_ACTIVE)."""
+    """True only if the PID exists AND is still running (GetExitCodeProcess distinguishes "alive" from "exited, PID reused").
+    Used by the client to detect a game crash: the watcher loop swallows all read errors silently,
+    so without this check a crash would just stop checks being sent forever with no visible error."""
     handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
     if _is_invalid_handle(handle):
         return False
@@ -333,29 +266,10 @@ def is_process_alive(pid):
 
 
 def is_dll_loaded(pid, dll_filename, retries=3, retry_delay=0.2):
-    """Checks if a DLL with this filename is already loaded in the target
-    process - avoids double-injecting if the client (or a previous run)
-    already did it.
-
-    Theoretical/preventive fix, not confirmed against an actual repro yet:
-    CreateToolhelp32Snapshot (and Module32First/Module32Next) against a
-    live target process can fail TRANSIENTLY - most commonly with
-    ERROR_PARTIAL_COPY (299), a known Windows quirk that happens if the
-    target's module list is being touched at that exact instant - and
-    this used to treat ANY such failure as a flat "not loaded", with no
-    retry. Both call sites of this function are correctly WRITTEN to skip
-    re-injecting when this returns True - the risk isn't in how they use
-    this, it's in this function occasionally lying to them. A single
-    false "not loaded" would be enough to trigger a real, unnecessary
-    re-injection into an ALREADY-hooked, still-live process (a new hook
-    attempt failing with MH_ERROR_ALREADY_CREATED against hooks a prior,
-    genuine injection already installed - and since that later attempt
-    never reaches 'hkProcessEvent: first call received', nothing gets
-    detected for the rest of that session: no chests, no mission
-    completions, no checks sent).
-
-    Retries a few times with a short delay before believing a failure,
-    rather than trusting a single snapshot attempt."""
+    """Checks if the DLL is already loaded in the target process (avoids double-injection).
+    Preventive: retries on transient snapshot failures (ERROR_PARTIAL_COPY) before returning False —
+    a single false "not loaded" would trigger an unnecessary re-injection that breaks the session
+    (MH_ERROR_ALREADY_CREATED, no checks sent for the rest of the run). Not confirmed by a real repro."""   
     last_error = None
     for attempt in range(retries):
         snapshot = kernel32.CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, pid)
@@ -391,9 +305,7 @@ def inject_dll(pid, dll_path):
 
     h_process = kernel32.OpenProcess(PROCESS_ALL_ACCESS, False, pid)
     if not h_process:
-        # Capture GetLastError() BEFORE anything else touches it (even
-        # the _try_get_process_image_path diagnostic call below makes its
-        # own kernel32 calls, which would otherwise clobber this).
+        # Capture GetLastError() before anything else (even the diagnostic call below) makes its own kernel32 calls and clobbers it.
         error = kernel32.GetLastError()
         if error == ERROR_ACCESS_DENIED:
             raise InjectionAccessDeniedError("OpenProcess", pid, _try_get_process_image_path(pid))
@@ -456,36 +368,13 @@ def inject_dll(pid, dll_path):
 
 
 def pick_target_pid(process_name, dll_filename, warn=print):
-    """Picks which Dungeons.exe to attach/inject THIS client into, and
-    is the one place that actually notices (and warns about) more than
-    one instance running - find_process_id/pymem.Pymem(name) alone
-    would silently just grab the first one every time, so with two game
-    instances open, every client launched kept attaching to the same
-    first process and the second player's game was never reachable by
-    anything, with no error anywhere to explain why.
-
-    Strategy: if exactly one Dungeons.exe is running, use it (no
-    warning - the common case). If more than one, pick the first PID
-    that does NOT already have dungeons_bridge.dll loaded - a process
-    with the DLL already loaded means SOME client already claimed and
-    injected it, so this new client should take the next free one
-    instead, letting each client naturally claim a different game
-    instance one at a time as they're launched. If every detected
-    instance already has the DLL loaded (all already claimed), falls
-    back to the first PID found, but with an explicit warning so the
-    person knows this client is sharing an already-injected process
-    rather than getting a distinct one.
-
-    `warn`: callable given the warning text (defaults to print; the
-    client passes its own logger so this shows up in its log/console).
-    Returns the picked pid, or None if no matching process was found."""
+    """Picks which Dungeons.exe to attach to; the one place that notices multiple instances.
+    One instance: use it. Multiple: pick the first without dungeons_bridge.dll already loaded.
+    All claimed: fall back to the first PID with a warning.
+    warn: callable for the warning text (defaults to print). Returns the picked PID or None."""
     pids = find_all_process_ids(process_name)
-    # A process that has already exited stays in the snapshot for as long as
-    # ANY handle to it is open - including the one our own client kept on the
-    # game that just crashed. Attaching to that corpse looks like a successful
-    # attach (the process is "found" instantly after a relaunch) but nothing
-    # can be injected into it, so the freshly relaunched game never got the DLL.
-    # Only live processes are candidates.
+    # A crashed process stays in the snapshot while any handle is open (including our own), so it looks "found"
+    # but injection into it silently fails — the relaunched game never gets the DLL. Only live PIDs are candidates.
     pids = [p for p in pids if is_process_alive(p)]
     if not pids:
         return None

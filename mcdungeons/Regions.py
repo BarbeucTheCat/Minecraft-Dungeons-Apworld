@@ -27,21 +27,9 @@ GOAL_MISSION_EVENT_NAME = "Victory - Goal Mission"
 
 
 def _place_victory_event(world: "MCDungeonsWorld", region: Region, location_name: str, event_name: str) -> None:
-    """Attach a Victory item to an existing real location, the top
-    emerald milestone or a mission's own Mission Complete check, both
-    reported by dungeons_reader.py when used.
-
-    Not modeled as a state.can_reach_location(...) rule: these locations
-    have no access_rule of their own, so that would be trivially True from
-    the start of generation, it couldn't distinguish "goal reached" from
-    "game just started". A locked item only enters state.has(...) once the
-    location is actually checked, which only happens when the running game
-    reports it, exactly the gate we want.
-
-    Uses world.create_item (a real, allocated item), NOT a code=None event
-    item: AP core's serialization asserts a location with a real address
-    must hold an item with a real code too, see Items.py's "Victory - ..."
-    entries for the two items this uses."""
+    """Attached to an existing real location (emerald milestone or Mission Complete check).
+No access_rule: the item only enters state.has() once the running game reports the location checked.
+Real codes, not events — AP core rejects code=None on a real-address location."""
     for loc in region.locations:
         if loc.name == location_name:
             loc.place_locked_item(world.create_item(event_name))
@@ -77,11 +65,11 @@ def create_regions(world: "MCDungeonsWorld") -> None:
     goal_mission_id = world.options.goal_mission.value
     goal_mission_zone = (GOAL_MISSION_ID_TO_ZONE[goal_mission_id]
                           if goal_mission_id != GoalMission.option_none else None)
-
-    #Which DLC packs are OPTIONAL (their locations never hold progression items). Chosen per pack:
-    #  * RequiredDlcs not empty -> only the listed packs are required, every other enabled pack is optional;
-    #  * RequiredDlcs empty     -> DlcMissionsOptional decides for all packs at once (on: all optional, off: none).
-    #The pack of the Goal Mission is always required: it is the player's real win condition.
+    
+    # Which packs are optional (locations never hold progression items):
+    #   RequiredDlcs non-empty → only those are required, rest are optional.
+    #   RequiredDlcs empty → DlcMissionsOptional decides for all.
+    # The Goal Mission's pack is always required.   
     enabled_dlc_packs = {z.dlc_pack for z in enabled_zones if z.category == "dlc"}
     chosen_packs = {DLC_PACK_BY_LABEL[label] for label in world.options.required_dlcs.value}
     if chosen_packs:
@@ -99,70 +87,35 @@ def create_regions(world: "MCDungeonsWorld") -> None:
         multiworld.regions.append(region)
         region_by_name[zone.internal_name] = region
 
-    #DlcMissionsOptional (default on): excludes all DLC zone's 
-    #check the same way as Bonus Chests below, so the fill never
-    #put a required item behind a check in a DLC mission. Only the
-    #Mission Complete location is excluded, Access item, chests, and
-    #boss kills stay untouched, so DLC content is still explorable.
-
-    #Exception: if the player chose this zone as their GoalMission, it's
-    #their real win condition (see _place_victory_event below) - an
-    #explicit goal always wins over the "optional" default.
+    # DlcMissionsOptional (default on): excludes DLC Mission Complete checks from progression fill
+    # (same as Bonus Chests). Access items, chests, and boss kills stay — DLC is still explorable.
+    # Exception: the Goal Mission zone is never treated as optional.   
         if zone.category == "dlc" and zone.dlc_pack in optional_dlc_packs:
             for loc in region.locations:
                 if loc.name == location_name:
                     loc.progress_type = LocationProgressType.EXCLUDED
                     break
 
-        #The Stronghold's real in-game unlock isn't "beat the previous
-        #mission" at all - it needs Eyes of Ender collected across 6
-        #OTHER specific missions, a cross-mission requirement this
-        #logic doesn't model yet (planned as a real check later). Its
-        #requires[] above (Obsidian Pinnacle) is a placeholder standing
-        #in for "somewhere reasonably late," not a claim that beating
-        #Obsidian Pinnacle actually unlocks it in-game. Excluding both
-        #this location and its boss kill (added further below) the
-        #same way DLC-optional missions are just above guarantees the
-        #fill algorithm never strands a required item behind a mission
-        #that can't reliably be completed on the timeline the logic
-        #assumes.
+    # requires[] (Obsidian Pinnacle) is a placeholder for "reasonably late" — the real in-game unlock
+    # (Eyes of Ender from 6 other missions) is modeled separately in Rules.py (needs_eyes).
+    # Location and boss kill excluded from progression fill so the fill never strands a required item here.   
         if zone.internal_name == "thestronghold" and not world.options.eye_of_ender_checks:
             for loc in region.locations:
                 if loc.name == location_name:
                     loc.progress_type = LocationProgressType.EXCLUDED
                     break
 
-        #Mooshroom Island ("??? (Mooshroom Island)") is a secret,
-        #post-game-only zone - only reachable after everything else is
-        #already done. Its Access item was already changed from
-        #progression to useful for the same reason (marking it
-        #progression pushed the fill algorithm to treat unlocking it as
-        #something to prioritize early, which makes no sense for
-        #content you can only reach at the very end). This is the other
-        #half of that: its own Mission Complete check (and its boss
-        #kill check, added further below) are excluded the same way
-        #DLC-optional missions are just above, so the fill algorithm
-        #only ever places filler there - nothing anyone (this player or
-        #any other) actually needs to progress can end up locked behind
-        #finishing a hidden bonus zone. Same goal_mission_zone
-        #exception as the DLC-optional block above: it's technically
-        #selectable as a GoalMission (GOAL_MISSION_ID_TO_ZONE covers
-        #every zone), and if a player explicitly chose it as their real
-        #win condition, excluding it would directly contradict that
-        #choice.
+    # Post-game-only secret zone. Checks excluded from progression fill (same as DLC-optional) so only
+    # filler lands here — nothing needed to progress is locked behind a hidden bonus zone.
+    # Exception: if chosen as GoalMission, never excluded.   
         if zone.internal_name == "mooshroomisland" and zone.internal_name != goal_mission_zone:
             for loc in region.locations:
                 if loc.name == location_name:
                     loc.progress_type = LocationProgressType.EXCLUDED
                     break
 
-    #Per-zone confirmed-fixed chest locations (see Locations.py's
-    #ZONE_CHEST_COUNTS comment) - each zone's own Chest/Supply Chest
-    #locations attach to that zone's own region, alongside its
-    #Mission Complete check. Only zones already in ZONE_CHEST_COUNTS
-    #get this (verified fixed layout so far); a zone whose DLC pack
-    #is disabled this generation is simply skipped, same as every
-    #other optional location group below.
+    # Fixed chest locations per zone (verified layout, see ZONE_CHEST_COUNTS), attached to the zone's own region.
+    # Only zones in ZONE_CHEST_COUNTS get these; disabled DLC packs are skipped like other optional groups.   
     for zone_name, (chest_n, supply_n) in ZONE_CHEST_COUNTS.items():
         region = region_by_name.get(zone_name)
         if not region:
@@ -176,14 +129,9 @@ def create_regions(world: "MCDungeonsWorld") -> None:
             zone_chest_locations[name] = ZONE_CHEST_TABLE[name]
         region.add_locations(zone_chest_locations, world.location_class)
 
-    #"Secret Zone Found" checks: only with the Secret Mission Access option on.
-    #The secret trigger lives in the secret zone's PARENT mission, so the
-    #check attaches to the parent's region (reachable exactly when you can
-    #play that mission). The secret zone itself is then unlocked by its
-    #"<Zone> Secret Access" item, no longer by finding the secret in-game.
-    #Skipped when either the parent or the secret zone itself is disabled
-    #(DLC pack off). DLC parents follow the same "optional DLC" exclusion
-    #as their Mission Complete check.
+    # Only with the Secret Mission Access option on. Attaches to the parent's region (the trigger is there).
+    # Unlocks the secret zone via its Secret Access item, not by finding the secret in-game.
+    # Skipped if parent or secret zone is disabled; DLC parents get the optional-DLC exclusion.   
     if world.options.secret_missions_require_secret:
         for parent_name, secret_name in SECRET_PARENT_TO_ZONE.items():
             parent_region = region_by_name.get(parent_name)
@@ -198,20 +146,8 @@ def create_regions(world: "MCDungeonsWorld") -> None:
                         loc.progress_type = LocationProgressType.EXCLUDED
                         break
 
-    #Global bonus chest locations: extra chests found across ALL
-    #confirmed zones combined, beyond each zone's own baseline (see
-    #Locations.py's get_bonus_chest_locations comment) - NOT tied to
-    #any specific zone's region, unlike the base chest locations
-    #above. Attached to Menu (always reachable) the same way
-    #emerald milestones are below, trimmed to THIS player's
-    #BonusChestCount option, not the full static headroom.
-
-    #Marked EXCLUDED, not left as ordinary locations: reaching a
-    #high-numbered bonus chest requires finding a lot of extra
-    #chests across every zone combined, which isn't guaranteed
-    #early in a run (or at all) - excluding them explicitly
-    #guarantees the fill algorithm never strands a progression
-    #item behind one.
+    # Global bonus chests (not tied to a zone), attached to Menu, trimmed to this player's BonusChestCount.
+    # Excluded from progression fill: reaching a high-numbered one isn't guaranteed early (or at all).   
     bonus_count = world.options.bonus_chest_count.value
     bonus_locations = get_bonus_chest_locations(bonus_count)
     menu.add_locations(bonus_locations, world.location_class)
@@ -230,12 +166,8 @@ def create_regions(world: "MCDungeonsWorld") -> None:
             menu.connect(target, f"Menu -> {zone.display_name}")
             continue
 
-        #skip_level_requires_map replaces "needs your direct predecessor's
-        #Access item" with "needs whichever zone(s) unlocked THAT
-        #predecessor" - see its own docstring for the full reasoning.
-        #Falls back to zone.requires itself for the cases it deliberately
-        #leaves untouched (root-adjacent zones, and Mooshroom Island's
-        #postgame everything-gate).
+        # Skips one level in the requires chain: uses the predecessor's own requires instead of the predecessor itself.
+        # Falls back to zone.requires for root-adjacent zones and Mooshroom Island.   
         valid_requires = [r for r in skip_level_map.get(zone.internal_name, zone.requires) if r in enabled_names]
         if not valid_requires:
             #Every real predecessor got disabled (their DLC pack is off) -
@@ -243,10 +175,7 @@ def create_regions(world: "MCDungeonsWorld") -> None:
             menu.connect(target, f"Menu -> {zone.display_name}")
             continue
 
-        #AND logic across all valid predecessors: connect the LAST
-        #predecessor's region -> target, with a rule that also checks
-        #every earlier predecessor is reachable. This keeps a single
-        #Entrance per zone regardless of how many prerequisites it has.
+        # Single entrance per zone: connects the last predecessor's region to the target, with a rule requiring all earlier predecessors to be reachable.   
         source = region_by_name[valid_requires[-1]]
         rule = make_zone_rule(world, zone, valid_requires)
         entrance = source.connect(target, f"{valid_requires[-1]} -> {zone.display_name}")
@@ -267,20 +196,8 @@ def create_regions(world: "MCDungeonsWorld") -> None:
             entrance = menu.connect(region, f"Menu -> {hunt.display_name}")
             entrance.access_rule = make_ancient_hunt_rule(world)
 
-    #Emerald milestones: no region of their own, just currency checks ---
-    #against a running total (dungeons_reader.py reports these via ---
-    #ap_client.py). Only the player's actual goal's worth of ---
-    #milestones gets added, even though the full 500..500000 range ---
-    #exists in LOCATION_TABLE for id-table purposes.
-
-    # EmeraldMode (see Options.py) decouples "do the intermediate
-    # milestone checks exist" from "does reaching the goal amount matter
-    # for victory": "both" (the default) does both, and every milestone
-    # up to the goal gets added. If EmeraldMode is "goal" only (checks
-    # off), none of the intermediate checks are added, but the single
-    # TOP milestone still needs to exist as a real Location so the
-    # completion condition below has something to check reachability
-    # against - it's added on its own in that case.
+    # Currency checks against a running total, attached to Menu (no region of their own).
+    # EmeraldMode "both" adds all milestones up to the goal; "goal" adds only the top one (still needed for the completion check).   
     goal = world.options.emerald_goal.value
     emerald_checks_on = world.options.emerald_mode.checks_enabled
     emerald_is_goal = world.options.emerald_mode.goal_enabled
@@ -289,17 +206,8 @@ def create_regions(world: "MCDungeonsWorld") -> None:
         if emerald_checks_on:
             milestone_locations = get_emerald_milestone_locations(goal)
             menu.add_locations(milestone_locations, world.location_class)
-            # EXCLUDED for the same reason Bonus Chests are, just above:
-            # there's no real logic modeling how much playtime it takes to
-            # earn a given emerald total (see _place_victory_event's own
-            # comment on this same gap for the goal condition). Without
-            # this, the fill algorithm could freely strand a genuinely
-            # required progression item behind the TOP milestone - a goal
-            # of 45000 emeralds, say - forcing an enormous, unguaranteed
-            # grind before that item is even reachable. Harmless if this
-            # milestone also ends up hosting the locked Victory event
-            # below (place_locked_item bypasses progress_type entirely,
-            # same as it does for Bonus Chests).
+            # Excluded from progression fill (same as Bonus Chests): no logic models emerald grind time, so a required item
+            # could be stranded behind a high milestone. Harmless if it hosts the Victory event (place_locked_item bypasses progress_type).   
             for loc in menu.locations:
                 if loc.name in milestone_locations:
                     loc.progress_type = LocationProgressType.EXCLUDED
@@ -311,16 +219,9 @@ def create_regions(world: "MCDungeonsWorld") -> None:
                 if loc.name == top_name:
                     loc.progress_type = LocationProgressType.EXCLUDED
 
-    #Boss first-kills: opt-in, and split into two independent
-    #toggles, BossKillChecks for base-game bosses, DlcBossKillChecks
-    #for DLC bosses (Options.py), so you can enable checks for one
-    #group without the other. Each check is attached to its own
-    #zone's Region rather than Menu, same access rule + DLC-pack
-    #gating as that zone's Mission Complete check. A boss whose zone
-    #didn't make it into region_by_name (DLC pack disabled) is simply
-    #skipped, its check isn't offered, matching that zone being
-    #unreachable this generation. See Locations.py's BOSS_ZONE
-    #comment for which two boss->zone mappings are still unconfirmed.
+    # Boss first-kill checks, two independent toggles (base / DLC).
+    # Attached to the zone's own region, same gating as its Mission Complete check; skipped if the zone's DLC pack is off.
+    # Two boss→zone mappings still unconfirmed (see BOSS_ZONE in Locations.py).   
     wanted_bosses = set()
     if world.options.boss_kill_checks:
         wanted_bosses.update(get_base_boss_names())
@@ -349,9 +250,8 @@ def create_regions(world: "MCDungeonsWorld") -> None:
                     loc.progress_type = LocationProgressType.EXCLUDED
                     break
 
-    #Mini boss kills: same idea as the boss first-kills above, one check per zone that has a mini boss,
-    #split into MiniBossKillChecks (base-game zones) and DlcMiniBossKillChecks (DLC zones). Attached to
-    #the zone's own Region, so a zone whose DLC pack is off simply has no check.
+    # Mini boss kill checks, two independent toggles (base / DLC).
+    # Attached to the zone's own region; skipped if the zone's DLC pack is off.   
     mini_boss_base_mode = world.options.mini_boss_kill_checks.value
     mini_boss_dlc_mode = world.options.dlc_mini_boss_kill_checks.value
 
@@ -374,8 +274,8 @@ def create_regions(world: "MCDungeonsWorld") -> None:
             if loc.name == type_loc_name:
                 loc.progress_type = LocationProgressType.EXCLUDED
 
-    #Eye of Ender checks: one per Eye type, placed in the parent mission of its chain (the sub-missions are
-    #not zones here). The six matching "Eye of Ender" items gate The Stronghold in Rules.py.
+    # Eye of Ender checks: one per Eye type, only with eye_of_ender_checks on. Placed in the parent mission
+    # of its chain. The six matching "Eye of Ender" items gate The Stronghold in Rules.py.
     if world.options.eye_of_ender_checks:
         for eye_type, _mission, eye_zone in EYE_OF_ENDER_TYPES:
             region = region_by_name.get(eye_zone)
@@ -394,21 +294,16 @@ def create_regions(world: "MCDungeonsWorld") -> None:
             villager_loc_name = villager_location_name(villager_key)
             region.add_locations({villager_loc_name: VILLAGER_TABLE[villager_loc_name]}, world.location_class)
 
-    #Optional DLC packs (see optional_dlc_packs above): now that every location of every zone exists, none of
-    #the locations of an optional pack's missions may hold a progression item - chests, boss and mini boss
-    #kills, secrets, everything. Only this pass is pack-wide; the Mission Complete exclusion above stays.
+    # Pack-wide exclusion for optional DLC packs: no progression items in any of their locations (chests, boss/mini boss kills, secrets, etc.).
+    # Separate from the Mission Complete exclusion above, which applies to all zones.   
     for zone in enabled_zones:
         if zone.category == "dlc" and zone.dlc_pack in optional_dlc_packs:
             for loc in region_by_name[zone.internal_name].locations:
                 loc.progress_type = LocationProgressType.EXCLUDED
 
-    #Win condition: Emerald Mode (reaching your Emerald Goal) and/or
-    #GoalMission (reaching a specific mission), and together when
-    #both are active (state.has_all requires every event name
-    #present). generate_early (__init__.py) already guarantees at
-    #least one of the two is active, so victory_event_names is never
-    #empty by the time we get here. See _place_victory_event above
-    #for why these are locked events, not a can_reach_location rule.
+    # Win condition: Emerald Goal and/or GoalMission (both when both are active).
+    # generate_early guarantees at least one is active, so victory_event_names is never empty.
+    # Locked events, not a can_reach rule — see _place_victory_event.   
     victory_event_names: List[str] = []
 
     if emerald_is_goal and goal >= 500:

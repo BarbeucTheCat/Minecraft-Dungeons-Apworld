@@ -2,7 +2,8 @@ from typing import Dict, List, Optional, Tuple
 
 from .ZoneData import ZONES, ANCIENT_HUNT_ZONES, ZONES_BY_NAME
 
-BASE_LOCATION_ID = 0xDC1000  # arbitrary offset - replace with your registered AP game ID block
+BASE_LOCATION_ID = 0xDC1000  # the offset that determines the location IDs; this value must not change
+
 
 _next_id = [BASE_LOCATION_ID]
 
@@ -12,10 +13,8 @@ def _alloc_id() -> int:
     return _next_id[0]
 
 
-# Placeholder: one "Mission Complete" location per zone. Swap this out for
-# real per-chest / per-objective locations (e.g. from chest_catalog.json)
-# once you're ready - the region wiring in Regions.py doesn't care how many
-# locations live in a region.
+# Placeholder: one "Mission Complete" per zone. Swap for real per-chest locations later —
+# region wiring doesn't care how many locations live in a region.   
 LOCATION_TABLE: Dict[str, int] = {
     f"{z.display_name} - Mission Complete": _alloc_id()
     for z in (ZONES + ANCIENT_HUNT_ZONES)
@@ -27,43 +26,23 @@ LOCATIONS_BY_ZONE: Dict[str, str] = {
 }
 
 
-# ------------------------------------------------------------------
-# Emerald milestone locations (dungeons_reader.py's currency watcher
-# reports these to the server via ap_client.py's send_location_checks).
-#
-# EmeraldGoal (see Options.py) is a per-player Range option from 1000 up
-# to 500000, so location_name_to_id at the World class level must contain
-# every POSSIBLE milestone up front (the full range), even though any one
-# player's actual goal only uses a prefix of it - AP resolves names to IDs
-# at generation time before options are locked in per-slot, so the table
-# can't be trimmed to just one player's goal.
-# ------------------------------------------------------------------
-
-EMERALD_MILESTONE_BASE_ID = 0xE4E4_0000  # must not collide with BASE_LOCATION_ID's range above
-EMERALD_MILESTONE_MAX = 500000  # deliberate 10x headroom above EmeraldGoal's actual
-                                 # ceiling (50000) - keeps this static ID table
-                                 # stable even if that ceiling is ever raised later
-
+# Full 500-step range in the table (not trimmed per player): AP resolves names→IDs before per-slot options exist.   
+EMERALD_MILESTONE_BASE_ID = 0xE4E4_0000  # Base ID must not collide with BASE_LOCATION_ID's range.
+EMERALD_MILESTONE_MAX = 500000  # 500000 is well above the current EmeraldGoal ceiling, so the table stays stable if it's raised later.
 
 def milestone_location_name(amount: int) -> str:
     return f"Emeralds: {amount}"
 
 
 def get_emerald_milestone_id(amount: int) -> int:
-    """Given a specific milestone amount (must be a multiple of 500),
-    returns its location ID directly - used by the client watcher to know
-    which ID to send when a threshold is crossed, without needing the
-    full table."""
+    """Converts a milestone amount (multiple of 500) to its location ID directly, so the client watcher doesn't need the full table."""
     if amount % 500 != 0:
         raise ValueError(f"{amount} is not a multiple of 500")
     return EMERALD_MILESTONE_BASE_ID + (amount // 500)
 
 
 def get_emerald_milestone_locations(goal: int) -> Dict[str, int]:
-    """Returns {location_name: location_id} for every 500-emerald
-    milestone from 500 up to (and including) goal. Used per-player in
-    Regions.py to add only the milestones relevant to that player's
-    emerald_goal option - NOT the full static range below."""
+    """Returns {name: id} for milestones 500 through goal (inclusive) — per-player subset, not the full static table."""
     if goal % 500 != 0:
         goal = (goal // 500) * 500  # defensive - EmeraldGoal.from_any already
                                      # rounds this, but don't trust callers blindly
@@ -73,9 +52,7 @@ def get_emerald_milestone_locations(goal: int) -> Dict[str, int]:
     }
 
 
-# Full static range for location_name_to_id (every possible milestone,
-# regardless of any one player's goal) - required because AP builds the
-# name->id table once at the class level, before per-slot options exist.
+# Full static range (not trimmed per player): AP builds the name→id table at class level, before per-slot options exist.
 EMERALD_MILESTONE_TABLE: Dict[str, int] = {
     milestone_location_name(amount): get_emerald_milestone_id(amount)
     for amount in range(500, EMERALD_MILESTONE_MAX + 1, 500)
@@ -85,17 +62,8 @@ EMERALD_MILESTONE_TABLE: Dict[str, int] = {
 LOCATION_TABLE.update(EMERALD_MILESTONE_TABLE)
 
 
-# ------------------------------------------------------------------
-# "Secret Zone Found" locations: one per secret zone, only offered when the
-# Secret Mission Access option is on. Finding the secret in-game (the
-# USecretComponent::SecretFound trigger, which lives in the secret zone's
-# PARENT mission - e.g. Creeper Woods for Creepy Crypt) no longer reveals
-# the secret mission; the client blocks that and sends this check instead,
-# and the mission itself is unlocked by its "<Zone> Secret Access" item.
-# IDs come from their own block, indexed by the zone's position in ZONES
-# (ZONES is append-only), so adding/removing other locations never shifts
-# them.
-# ------------------------------------------------------------------
+# One per secret zone, only with the option on. Attaches to the parent's region (the trigger is there).
+# IDs in their own block, indexed by ZONES position (append-only) — never shift.
 SECRET_ZONE_FOUND_BASE_ID = 0xDC6000  # separate block - clear of every other range above
 
 
@@ -114,9 +82,7 @@ SECRET_ZONE_FOUND_BY_ZONE: Dict[str, str] = {
     for z in ZONES if z.secret
 }
 
-# parent zone internal_name (where the secret trigger physically is) ->
-# the secret zone it reveals. Derived from ZoneData's requires[]: the
-# secret zone's single direct predecessor.
+# Maps parent zone internal_name → the secret zone it reveals (derived from the secret zone's requires[]).
 SECRET_PARENT_TO_ZONE: Dict[str, str] = {
     z.requires[0]: z.internal_name for z in ZONES if z.secret and z.requires
 }
@@ -124,48 +90,12 @@ SECRET_PARENT_TO_ZONE: Dict[str, str] = {
 LOCATION_TABLE.update(SECRET_ZONE_FOUND_TABLE)
 
 
-# ------------------------------------------------------------------
-# Boss-kill locations: one "First Kill" check per boss, base-game
-# Minecraft Dungeons only (the Arcade-exclusive bosses - Enderman, the
-# two Evokers, Giant Cave Spider, Giant Royal Guard, Obsidian Monstrosity
-# - don't apply to this world and aren't included). Gated behind the
-# boss_kill_checks option (off by default) - see Options.py.
-#
-# BOSS_ZONE maps each boss to the zone (ZoneData.py internal_name) its
-# check gets attached to in Regions.py - same access rule and DLC-pack
-# gating as that zone's own Mission Complete check, so a boss whose DLC
-# pack is disabled is correctly unreachable rather than silently offered
-# anyway.
-#
-# All entries below have been verified against the Minecraft Dungeons
-# wiki (fandom):
-#   - Arch-Illager fights atop Obsidian Pinnacle - previously wrongly
-#     mapped to Highblock Halls. Heart of Ender appears at the same
-#     spot immediately after, but isn't included as its own entry
-#     here: the client can't reliably detect its kill (no confirmed
-#     EntityType - see BOSS_CLASS_LOOKUP in dungeons_reader.py, which
-#     needs a one-time manual calibration pass and is usually empty),
-#     so Obsidian Pinnacle gets a single boss-kill check via
-#     Arch-Illager instead of two unreliable ones.
-#   - Nameless One dwells in the Desert Temple - previously wrongly
-#     mapped to Underhalls.
-#   - Redstone Monstrosity is built within the Fiery Forge - previously
-#     an unconfirmed guess pointing at Obsidian Pinnacle.
-#   - Ancient Guardian resides in the Abyssal Monument - previously
-#     wrongly mapped to Radiant Ravine.
-#   - Jungle Abomination resides in the Overgrown Temple - previously
-#     wrongly mapped to Panda Plateau (bamboobluff).
-#   - Wretched Wraith dwells in the Lone Fortress - previously wrongly
-#     mapped to Lost Settlement.
-#   - Corrupted Cauldron (Soggy Swamp), Mooshroom Monstrosity
-#     (Mooshroom Island), Tempest Golem (Gale Sanctum), Treetop
-#     Whisperer (Treetop Tangle), and Vengeful Heart of Ender (Broken
-#     Citadel) were already correct. Vengeful Heart of Ender is kept
-#     despite the same EntityType caveat since it's the DLC final
-#     boss and the only check on its zone either way - see
-#     BOSS_ENTITY_TYPE_IDS comment in dungeons_reader.py.
-# ------------------------------------------------------------------
+# One "First Kill" check per base-game boss.
+# Gated behind boss_kill_checks; BOSS_ZONE maps each boss to the zone whose region the check attaches to
+# (same access rule and DLC gating as that zone's Mission Complete check).
 
+# Heart of Ender excluded: client can't reliably detect its kill (no confirmed EntityType).
+# Vengeful Heart of Ender kept despite the same caveat — it's the only check on its zone.
 BOSS_ZONE: Dict[str, str] = {
     "Arch-Illager": "obsidianpinnacle",
     "Corrupted Cauldron": "soggyswamp",
@@ -196,41 +126,27 @@ BOSS_KILL_TABLE: Dict[str, int] = {
 
 
 def get_boss_kill_location_id(boss_name: str) -> int:
-    """Given a boss's display name (must match BOSS_NAMES exactly), returns
-    its location ID directly - used by the client watcher to know which ID
-    to send when that boss's first kill is detected."""
+    """Converts a boss display name to its location ID, so the client watcher knows which ID to send on first kill."""
     return BOSS_KILL_TABLE[boss_kill_location_name(boss_name)]
 
 
 def get_base_boss_names() -> List[str]:
-    """Bosses whose zone is base-game (ZoneInfo.category == 'base') -
-    gated by the BossKillChecks option, see Options.py. Computed from
-    BOSS_ZONE + ZONES_BY_NAME rather than hardcoded, so it can't drift
-    out of sync if BOSS_ZONE or a zone's category ever changes."""
+    """Base-game bosses (zone category == 'base'), gated by BossKillChecks.
+    Derived from BOSS_ZONE + ZONES_BY_NAME so it can't drift if either changes."""
     return [name for name, zone in BOSS_ZONE.items() if ZONES_BY_NAME[zone].category == "base"]
 
 
 def get_dlc_boss_names() -> List[str]:
-    """Bosses whose zone belongs to a DLC pack (ZoneInfo.category ==
-    'dlc') - gated by the separate DlcBossKillChecks option, see
-    Options.py."""
+    """DLC bosses (zone category == 'dlc'), gated by DlcBossKillChecks."""
     return [name for name, zone in BOSS_ZONE.items() if ZONES_BY_NAME[zone].category == "dlc"]
 
 
 LOCATION_TABLE.update(BOSS_KILL_TABLE)
 
 
-# ------------------------------------------------------------------
-# Mini boss kill locations: one "Mini Boss Kill" check per zone that has a mini boss (a "powerful mob",
-# the ones the client's zone mini boss rule is about: client/miniboss.py ZONE_MINIBOSSES). The check is
-# sent when a powerful mob is beaten in that zone. Gated behind mini_boss_kill_checks (base-game zones)
-# and dlc_mini_boss_kill_checks (DLC zones) - both off by default, see Options.py - and attached to the
-# zone's own Region in Regions.py, like the boss first-kills above.
-#
-# MINIBOSS_ZONES order decides the IDs: only ever APPEND to it. Mooshroom Island, The Stronghold, Squid
-# Coast, Arch Haven, Underhalls and Nether Wastes have no mini boss, so no check. A test
-# (test_client_data.py) keeps this list in sync with ZONE_MINIBOSSES.
-# ------------------------------------------------------------------
+# One "Mini Boss Kill" check per zone that has a mini boss (see ZONE_MINIBOSSES in client/miniboss.py).
+# Gated behind mini_boss_kill_checks / dlc_mini_boss_kill_checks (both off by default).
+# MINIBOSS_ZONES order decides IDs — append-only. A test keeps it in sync with ZONE_MINIBOSSES.
 MINIBOSS_ZONES: List[str] = [
     # base game
     "creeperwoods", "creepycrypt", "pumpkinpastures", "soggyswamp", "soggycave", "redstonemines",
@@ -263,8 +179,7 @@ MINI_BOSS_KILL_TABLE: Dict[str, int] = {
 
 
 def get_mini_boss_kill_location_id(zone_internal_name: str) -> int:
-    """Location ID of a zone's mini boss kill check (zone must be in MINIBOSS_ZONES) - used by the
-    client watcher to know which ID to send when a powerful mob is beaten there."""
+    """Location ID of a zone's mini boss kill check (zone must be in MINIBOSS_ZONES), so the client watcher knows which ID to send."""
     return MINI_BOSS_KILL_TABLE[mini_boss_kill_location_name(zone_internal_name)]
 
 
@@ -281,24 +196,18 @@ def get_dlc_mini_boss_zones() -> List[str]:
 LOCATION_TABLE.update(MINI_BOSS_KILL_TABLE)
 
 
-# ------------------------------------------------------------------
-# Mini boss checks - the two modes (options mini_boss_kill_checks / dlc_mini_boss_kill_checks, values:
-# 0 none, 1 per_type, 2 per_zone, 3 both):
-#   per_zone: the "<Zone> - Mini Boss Kill" checks above. The client FORCES a mini boss to appear in every zone
-#             that has one (the zone mini boss rule, see client/miniboss.py), so these are always obtainable.
-#   per_type: one "Mini Boss - <Type>" check per kind of mini boss, sent the first time one of that kind is beaten
-#             anywhere. A given kind cannot be forced to appear, so these locations are EXCLUDED (they can only hold
-#             filler, never progression items) - see Regions.py.
-# MINIBOSS_ZONE_TYPE is the mini boss pinned to each zone (client/miniboss.py ZONE_MINIBOSSES - a test keeps them
-# in sync); MINIBOSS_TYPE_ORDER decides the per-type IDs: only ever APPEND to it.
-# ------------------------------------------------------------------
+# Mini boss checks, two modes (per_zone / per_type, or both):
+#   per_zone: forced to appear in every zone that has one — always obtainable.
+#   per_type: one per boss kind, first kill anywhere; can't be forced, so excluded from progression.
+# MINIBOSS_ZONE_TYPE maps each zone to its pinned boss type (synced with client via test).
+# MINIBOSS_TYPE_ORDER decides per-type IDs — append-only.
 MINIBOSS_MODE_NONE, MINIBOSS_MODE_PER_TYPE, MINIBOSS_MODE_PER_ZONE, MINIBOSS_MODE_BOTH = 0, 1, 2, 3
 
 MINIBOSS_TYPE_ORDER: List[str] = [
     "enderman", "skeletonhorseman", "evoker", "redstonegolem", "illusioner",
     "drownednecromancer", "elderguardian", "wildfire", "ghast", "endersent",
-    # Mini bosses the game does not pin to a zone and the client cannot summon: they only count when they show up
-    # and get beaten (per-type checks only - see MINIBOSS_EXTRA_TYPE_ZONES). Appended, so no ID above moves.
+    # Mini bosses not pinned to a zone and not summonable by the client — only count if they happen to appear.
+    # Per-type checks only (see MINIBOSS_EXTRA_TYPE_ZONES). Appended, so no existing ID shifts.   
     "pillagerraidcaptain", "vindicatorraidcaptain",
     "endersentthornblight", "endersentvoidstrike", "endersentwritherot",
     "endersenteverfire", "endersentsurgefiend", "endersentdeadeye",
@@ -327,9 +236,8 @@ MINIBOSS_ZONE_TYPE: Dict[str, str] = {
     "basaltdeltas": "ghast", "netherfortress": "wildfire",
     "enderwilds": "endersent", "endcitadel_blightedcitadel": "endersent",
 }
-# Where the types without a pinned zone show up, in order of preference (the first one wanted + available holds the
-# check, see wanted_mini_boss_type_homes). Raid Captains were seen in Mooshroom Island (base game), Abyssal Monument
-# and Basalt Deltas (DLC); the Endersent variants belong to the Echoing Void zones.
+# Zones where unpinned types can appear, in order of preference (first available wins).
+# Raid Captains: Mooshroom Island, Abyssal Monument, Basalt Deltas. Endersents: Echoing Void zones.
 MINIBOSS_EXTRA_TYPE_ZONES: Dict[str, List[str]] = {
     "pillagerraidcaptain": ["mooshroomisland", "abyssalmonument", "basaltdeltas"],
     "vindicatorraidcaptain": ["mooshroomisland", "abyssalmonument", "basaltdeltas"],
@@ -379,10 +287,9 @@ def wanted_mini_boss_zones(base_mode: int, dlc_mode: int) -> set:
 
 
 def wanted_mini_boss_type_homes(base_mode: int, dlc_mode: int, available_zones) -> Dict[str, str]:
-    """{type: zone whose Region holds that type's check}. A type's check exists when at least one AVAILABLE zone
-    (its DLC pack on) that uses it has its group set to per_type or both; the home is the first such zone in
-    MINIBOSS_TYPE_ZONES order (the zones that pin the type first, i.e. the earliest mission), so the check is
-    reachable as early as possible."""
+    """Maps a mini boss type to the zone whose Region holds its check.
+    Only when at least one available zone (DLC pack on) has per_type or both.
+    Picks the earliest such zone in MINIBOSS_TYPE_ZONES order for maximum reachability."""   
     homes: Dict[str, str] = {}
     for type_key in MINIBOSS_TYPE_ORDER:
         for zone in MINIBOSS_TYPE_ZONES[type_key]:
@@ -395,14 +302,9 @@ def wanted_mini_boss_type_homes(base_mode: int, dlc_mode: int, available_zones) 
 LOCATION_TABLE.update(MINI_BOSS_TYPE_TABLE)
 
 
-# ------------------------------------------------------------------
-# Eye of Ender checks (option eye_of_ender_checks): one check per EEyeOfEnderType (Dungeons SDK enum:
-# 1 DEEPWOOD_BROOK, 2 OLD_TOWN_HALL, 3 SUNKEN_WATCHTOWER, 4 THE_UNDERCROFT, 5 THE_TRIAL_OF_THE_NAMELESS,
-# 6 HIGHBLOCK_HIDEAWAY - each Eye is named after the mission it opens at the Stronghold frame). A mini boss
-# drops each Eye; the client sends the check when the Eye shows up in the level, reading its type.
-# The sub-missions (Deepwood Brook, Old Town Hall...) are not zones here, so every check lives in the PARENT
-# mission of its chain. IDs: own block, order = Eye type, only ever append.
-# ------------------------------------------------------------------
+# One check per Eye of Ender type (6), only with the option on. A mini boss drops each Eye; the client
+# sends the check when it appears in the level. Sub-missions aren't zones here, so checks live in the parent.
+# IDs in their own block, append-only.   
 EYE_OF_ENDER_TYPES: List[Tuple[int, str, str]] = [
     # (EEyeOfEnderType value, mission the Eye is named after, parent zone of that chain)
     (1, "Deepwood Brook", "creeperwoods"),
@@ -437,23 +339,17 @@ def get_eye_of_ender_location_id(eye_type: int) -> int:
 LOCATION_TABLE.update(EYE_OF_ENDER_TABLE)
 
 
-# Villager checks (option villager_checks): freeing a captured villager in a mission is a check, and the camp merchant it
-# would have unlocked arrives as an item instead (Items.py VILLAGER_ITEM_NAMES). Only the five captured camp merchants of
-# the base game are known (zones from the wiki); the DLC ones are not yet - the client logs every merchant unlock it sees
-# (dungeons_bridge_debug.log / /villager), so the missing ones can be added here once their class names are known.
+# Villager checks (option villager_checks): freeing a captured villager sends a check; the merchant arrives as an item.
+# Base-game merchants confirmed; DLC ones pending (client logs them to dungeons_bridge_debug.log for identification).
+# Tuple: (key, class name fragment, display name = item name, zone internal name).
 VILLAGER_TYPES: List[Tuple[str, str, str, str]] = [
-    # (key, lowercase fragment of the merchant definition class name, display name = item name, zone internal name)
     ("village", "villagemerchant", "Village Merchant", "creeperwoods"),
     ("mystery", "mysterymerchant", "Mystery Merchant", "pumpkinpastures"),
     ("luxury", "luxurymerchant", "Luxury Merchant", "cacticanyon"),
     ("giftwrapper", "giftwrappermerchant", "Gift Wrapper", "soggyswamp"),
     ("blacksmith", "blacksmithmerchant", "Blacksmith", "redstonemines"),
-    # Added at the END so no villager location/item ID shifts. The fragments are guesses from the lobby actors
-    # BP_LobbyVillagerEnchanterMerchant_C / BP_LobbyVillagerPiglinMerchant_C (matched as a substring of the lowercase
-    # merchant definition class name, so "enchant" covers Enchanter/Enchantment/Enchantsmith).
     ("enchantsmith", "enchant", "Enchantsmith", "highblockhalls"),
-    # The Piglin Merchant is not rescued: it is unlocked by completing at least one Ancient Hunt (so this check
-    # exists only with the ancient_hunts option; its region is the first hunt, any hunt triggers it in game).
+    # Piglin Merchant is not rescued — unlocked by completing an Ancient Hunt (check only with ancient_hunts option).
     ("piglin", "piglin", "Piglin Merchant", "hm_woodlandmansion"),
 ]
 VILLAGER_BASE_ID = 0xDC3F00  # clear of EYE_OF_ENDER (0xDC3E00) and ZONE_CHEST (0xDC4000)
@@ -484,21 +380,9 @@ def get_villager_location_id(key: str) -> int:
 LOCATION_TABLE.update(VILLAGER_TABLE)
 
 
-# ------------------------------------------------------------------
-# Ancient Hunt boss-kill locations: one "Boss Kill" check per hunt
-# (Woodland Mansion, Woodland Prison, Spider Cave), separate from that
-# hunt's existing "Mission Complete" location. Gated by the
-# ancient_hunt_boss_checks option (off by default, see Options.py) - only
-# meaningful when ancient_hunts is also on, since these get added to the
-# same Region as the hunt's own Mission Complete in Regions.py and are
-# unreachable if that Region doesn't exist this generation.
-#
-# Not naming these after a specific creature (e.g. "Ancient Evoker") -
-# unlike BOSS_ZONE above, what exactly you're hunting in each of these
-# three missions isn't confirmed, so the location is just named after
-# the hunt itself.
-# ------------------------------------------------------------------
-
+# One "Boss Kill" check per Ancient Hunt (3), separate from Mission Complete.
+# Gated by ancient_hunt_boss_checks (off by default); only meaningful when ancient_hunts is on.
+# Named after the hunt, not a specific creature — the exact target isn't confirmed.
 ANCIENT_HUNT_BOSS_KILL_BASE_ID = 0xDC3800  # separate block - clear of BOSS_KILL's and ZONE_CHEST's ranges
 
 
@@ -514,24 +398,10 @@ ANCIENT_HUNT_BOSS_KILL_TABLE: Dict[str, int] = {
 LOCATION_TABLE.update(ANCIENT_HUNT_BOSS_KILL_TABLE)
 
 
-# ------------------------------------------------------------------
-# Per-zone, per-chest locations, for zones with a CONFIRMED fixed chest
-# layout - verified by the player directly, zone by zone (not assumed
-# for every zone in the game; other zones may have randomized chest
-# placement/count and shouldn't be added here until checked). Each
-# zone gets its own "<Zone> - Chest N" series (normal Wooden/Fancy/
-# Deluxe chests) and, separately, "<Zone> - Supply Chest N" series
-# (Supply Station) - two independent counters per zone, since they're
-# detected via two different real class-name patterns (see
-# dungeons_reader.py's classify_interactable_class) and the two counts
-# don't have to match.
-#
+# Per-zone chest locations, only for zones with a CONFIRMED fixed layout (verified live, zone by zone).
+# Two independent counters per zone: regular chests and supply chests (different detection patterns).
 # ZONE_CHEST_COUNTS: internal_name -> (chest_count, supply_chest_count).
-# Confirmed live, one zone at a time, via dungeons_bridge.dll's
-# OnInteracted hook. Add a new zone here (and keep ap_world/locations.py's
-# mirror in sync) once its layout is confirmed fixed too.
-# ------------------------------------------------------------------
-
+# Add a new zone once its layout is confirmed; keep the mirror in locations.py in sync.
 BASE_ZONE_CHEST_COUNTS: Dict[str, Tuple[int, int]] = {
     "squidcoast": (4, 1),
     "soggyswamp": (5, 1),
@@ -551,24 +421,13 @@ BASE_ZONE_CHEST_COUNTS: Dict[str, Tuple[int, int]] = {
     "underhalls": (3, 0),
 }
 
-# ------------------------------------------------------------------
-# DLC zones. To support the chests of a DLC mission, measure them in-game and add ONE line here:
-#     "dingyjungle": (chest_count, supply_chest_count),
-# The client helps: opening chests in a zone that is not listed yet logs a running tally
-# ("... chest(s), ... supply chest(s) opened this run") and keeps the highest tally seen per zone in
-# dlc_chest_counts_seen.json, so a full clear of the mission gives the numbers to enter below.
-# The zone must be a DLC zone of ZoneData.py (its chests only exist when its DLC pack is enabled).
-#
-# Location IDs for DLC chests come from their own block (DLC_ZONE_CHEST_BASE_ID), with a FIXED
-# range per zone derived from the zone's position in ZoneData.ZONES. Adding or changing one DLC
-# zone therefore never shifts the IDs of any other zone, and the base-game IDs (block
-# ZONE_CHEST_BASE_ID) never change either - old seeds stay valid. Keep a zone's total
-# (chests + supply chests) under DLC_ZONE_CHEST_SLOTS_PER_ZONE.
-# ------------------------------------------------------------------
+# DLC zone chests: add one line per zone once measured in-game (client logs tallies to dlc_chest_counts_seen.json).
+# Zone must be a DLC zone in ZoneData.py.
+# IDs in their own block (DLC_ZONE_CHEST_BASE_ID), fixed range per zone — adding one never shifts others.
+# Keep total (chests + supply) under DLC_ZONE_CHEST_SLOTS_PER_ZONE.
 DLC_ZONE_CHEST_COUNTS: Dict[str, Tuple[int, int]] = {
-    # (chests, supply chests) as read off the in-game map of each mission. Secrets are NOT counted (they
-    # send no chest check); a secret that turns out to be a chest still feeds the global bonus pool.
-    # Nether pack: older measurements (minimum of the chest counter), not re-measured yet.
+    # (chests, supply chests) read from the in-game map. Secrets not counted (no chest check); if a secret is a chest, it feeds the global bonus pool.
+    # Nether pack: older measurements (minimum of the counter), not re-measured.
     "netherwastes": (1, 0),
     "warpedforest": (5, 0),
     "crimsonforest": (1, 0),
@@ -595,8 +454,7 @@ DLC_ZONE_CHEST_COUNTS: Dict[str, Tuple[int, int]] = {
     "endlessrampart": (5, 0),      # Colossal Rampart
 }
 
-# Base-game zones measured AFTER the original base table was frozen. They are allocated after every
-# zone of BASE_ZONE_CHEST_COUNTS, so no existing base-game ID shifts (see the loop below).
+# Base-game zones measured after the original table was frozen; allocated after BASE_ZONE_CHEST_COUNTS so no existing ID shifts.
 LATE_BASE_ZONE_CHEST_COUNTS: Dict[str, Tuple[int, int]] = {
     "mooshroomisland": (1, 0),     # the "???" mission: map counter 0/1 chests, 0/0 secrets
 }
@@ -629,12 +487,8 @@ def _alloc_chest_id() -> int:
     return _chest_id[0]
 
 
-# Sorted for deterministic ID assignment across regeneration runs - dict
-# iteration is insertion order in modern Python, but sorting explicitly
-# removes any dependency on ZONE_CHEST_COUNTS's literal key order
-# staying the same if it's ever reordered/edited later.
-# Base game: sequential IDs in sorted zone order. NEVER add DLC zones to this loop - that would
-# shift every base-game ID that sorts after them (they get their own block just below).
+# Sorted for deterministic IDs (independent of ZONE_CHEST_COUNTS key order).
+# Base game only — DLC zones have their own block below; adding them here would shift base IDs.
 for _zone_name in sorted(BASE_ZONE_CHEST_COUNTS):
     _chest_n, _supply_n = BASE_ZONE_CHEST_COUNTS[_zone_name]
     for _n in range(1, _chest_n + 1):
@@ -670,9 +524,7 @@ for _zone_name, (_chest_n, _supply_n) in DLC_ZONE_CHEST_COUNTS.items():
 
 
 def get_zone_chest_location_id(zone_internal_name: str, n: int) -> int:
-    """Given a zone and a 1-based chest number, returns its location ID -
-    used by the client watcher to know which ID to send as each chest
-    gets opened, in discovery order."""
+    """Returns the location ID for a zone's Nth chest (1-based), so the client watcher knows which ID to send as chests are opened."""
     return ZONE_CHEST_TABLE[zone_chest_location_name(zone_internal_name, n)]
 
 
@@ -684,32 +536,12 @@ def get_zone_supply_chest_location_id(zone_internal_name: str, n: int) -> int:
 LOCATION_TABLE.update(ZONE_CHEST_TABLE)
 
 
-# ------------------------------------------------------------------
-# GLOBAL bonus chest locations - not tied to any specific zone. A
-# zone's confirmed count (ZONE_CHEST_COUNTS above) is what's been
-# directly verified so far, but any confirmed zone may turn out to have
-# MORE chests than that in practice - a layout variant, a secret room,
-# etc. Every EXTRA chest found, across ALL confirmed zones combined
-# (beyond that zone's own confirmed baseline), sends the next globally-
-# numbered "Bonus Chest N" check, 1:1 - discovery order across every
-# zone at once, not per-zone.
-#
-# The full table below is a fixed 100-slot headroom, independent of any
-# one player's BonusChestCount choice (Options.py, 0-100, default 20) -
-# same reasoning as EMERALD_MILESTONE_TABLE: AP resolves the name->id
-# table once at the class level, before per-slot options are locked in,
-# so it can't be sized to just one player's chosen count.
-# get_bonus_chest_locations() below is what Regions.py actually uses
-# per-player, trimmed to that player's count.
-#
-# These are marked LocationProgressType.EXCLUDED in Regions.py, NOT
-# just left as ordinary locations - reaching a high-numbered bonus
-# chest requires finding a lot of extra chests across every zone
-# combined, which the fill algorithm has no way to know is "hard" on
-# its own; excluding them explicitly guarantees the fill algorithm
-# never places a progression item there, so an early-game item can
-# never end up stranded behind, say, Bonus Chest 100.
-# ------------------------------------------------------------------
+# Global bonus chest locations — not tied to a zone. Every extra chest beyond a zone's confirmed baseline
+# sends the next "Bonus Chest N" (discovery order across all zones combined).
+# Full 100-slot table is static (AP resolves name→id at class level, before per-slot options);
+# get_bonus_chest_locations() trims per-player in Regions.py.
+# Marked EXCLUDED: reaching a high-numbered one isn't guaranteed early, so fill must never strand
+# a progression item there.
 
 MAX_BONUS_CHESTS = 100  # full static headroom - matches BonusChestCount's range_end
 BONUS_CHEST_BASE_ID = 0xDC5000  # separate block - clear of every other range above
@@ -726,16 +558,12 @@ BONUS_CHEST_TABLE: Dict[str, int] = {
 
 
 def get_bonus_chest_location_id(n: int) -> int:
-    """Given a 1-based global bonus-slot number, returns its location ID
-    directly - used by the client watcher each time an extra chest is
-    found (in any confirmed zone, beyond that zone's own baseline)."""
+    """Returns the location ID for a global bonus chest slot (1-based), so the client watcher knows which ID to send when an extra chest is found."""
     return BONUS_CHEST_TABLE[bonus_chest_location_name(n)]
 
 
 def get_bonus_chest_locations(count: int) -> Dict[str, int]:
-    """Returns {location_name: id} for however many bonus slots THIS
-    player's BonusChestCount choice allows (0..MAX_BONUS_CHESTS) - NOT
-    the full static headroom above. Used per-player in Regions.py."""
+    """Returns {name: id} for this player's bonus chest slots (0..BonusChestCount) — per-player subset, not the full static table."""
     count = max(0, min(count, MAX_BONUS_CHESTS))
     return {
         bonus_chest_location_name(n): get_bonus_chest_location_id(n)

@@ -52,7 +52,11 @@ class EchoingVoidDLC(Toggle):
 
 
 class DlcMissionsOptional(Toggle):
-    """Make DLC missions optional: if your goal is in the mainland, you don't have to complete any DLC mission to finish the game."""
+    """Make DLC missions optional: if your goal is in the mainland, you don't have to complete any DLC mission to finish the game.
+    Optional DLC packs never hold progression items, but they stay playable.
+    Only used when "Required DLC Packs" is empty: if you list any pack there, that list decides instead.
+    Turn this off (with Required DLC Packs empty) to make every enabled DLC pack required.
+    A pack that contains your Goal Mission is always required."""
     display_name = "DLC Missions Optional"
     default = Toggle.option_true
 
@@ -72,24 +76,24 @@ class RequiredDlcs(OptionSet):
     """Choose which DLC packs may hold important progression items. A selected DLC and its missions can contain
     items you need to progress, so you must play it. If a DLC is not selected, its checks only ever contain
     non-progression items (it stays playable, just never required).
-    Leave empty to let "DLC Missions Optional" decide for all packs at once. A listed pack must also be enabled
-    with its own DLC option. If your Goal Mission is in a DLC, that pack is always selected."""
+    If you list any pack here, only those packs are required and "DLC Missions Optional" is ignored.
+    Leave empty to let "DLC Missions Optional" decide for all packs at once (off = every enabled pack is required).
+    A listed pack must also be enabled with its own DLC option. If your Goal Mission is in a DLC, that pack is always selected."""
     display_name = "Required DLC Packs"
     valid_keys = frozenset(DLC_PACK_BY_LABEL)
 
 
+# The mission list in this docstring is shown to players: update it when a zone with secret=True is added in ZoneData.py.
 class SecretMissionsAccess(Toggle):
-    """If enabled, a secret mission is unlocked by its own single "Secret Access" item (it has no separate "Access"
-    item) before you can access it (Creepy Crypt, Arch Haven,
-    Soggy Cave, Lower Temple, Underhalls, Panda Plateau, Lost Settlement,
-    Colossal Rampart, Radiant Ravine, Crimson Forest, Soul Sand Valley,
-    Nether Fortress)"""
+    """If enabled, each secret mission is unlocked by its own single "Secret Access" item, which replaces its normal
+    "Access" item. Secret missions: Creepy Crypt, Arch Haven, Soggy Cave, Lower Temple, Underhalls, Panda Plateau,
+    Lost Settlement, Colossal Rampart, Radiant Ravine, Crimson Forest, Soul Sand Valley, Nether Fortress."""
     display_name = "Secret Mission Access"
 
 
 class AncientHuntsEnabled(Toggle):
     """[NOT TESTED] Include the three Ancient Hunt missions (Woodland Mansion, Woodland
-    Prison, Spider Cave) that you need to beat and find an item to unlock them"""
+    Prison, Spider Cave). A single "Ancient Hunt Access" item unlocks all three at once."""
     display_name = "Ancient Hunts"
 
 
@@ -109,13 +113,11 @@ class DlcBossKillChecks(Toggle):
 
 
 class MiniBossKillChecks(Choice):
-    """Checks for beating mini bosses (powerful mobs) in base-game missions.
-    none: no mini boss checks.
-    per_type: one check per kind of mini boss, the first time you beat one anywhere. A kind cannot be forced to
-    appear, so these checks never hold progression items.
-    per_zone: one check per mission that has a mini boss. A mini boss is forced to appear in every such mission
-    (summoned when you open the mission's last chest check if none was beaten there yet).
-    both: per_type and per_zone."""
+    """Mini boss checks in base-game missions.
+    per_type: one per boss kind, first kill anywhere; can't be forced, so never holds progression.
+    per_zone: one per mission, forced to appear (summoned from last chest if none beaten).
+    both: both.
+    none: no mini boss checks."""
     display_name = "Mini Boss Kill Checks"
     option_none = 0
     option_per_type = 1
@@ -128,13 +130,11 @@ class MiniBossKillChecks(Choice):
 
 
 class DlcMiniBossKillChecks(Choice):
-    """Checks for beating mini bosses (powerful mobs) in DLC missions (only the packs that are enabled).
-    none: no mini boss checks.
-    per_type: one check per kind of mini boss, the first time you beat one anywhere. A kind cannot be forced to
-    appear, so these checks never hold progression items.
-    per_zone: one check per mission that has a mini boss. A mini boss is forced to appear in every such mission
-    (summoned when you open the mission's last chest check if none was beaten there yet).
-    both: per_type and per_zone."""
+    """Mini boss checks in DLC missions (enabled DLC packs only).
+    per_type: one per boss kind, first kill anywhere; can't be forced, so never holds progression.
+    per_zone: one per mission, forced to appear (summoned from last chest if none beaten).
+    both: both.
+    none: no mini boss checks."""
     display_name = "DLC Mini Boss Kill Checks"
     option_none = 0
     option_per_type = 1
@@ -147,15 +147,13 @@ class DlcMiniBossKillChecks(Choice):
 
 
 class EyeOfEnderChecks(Toggle):
-    """Makes the Eyes of Ender randomized in the multiworld. They become 6 checks (one per zone of appearance)
-    that you need to collect, and also 6 items that you need to collect before you can go to the Stronghold."""
+    """Makes Eyes of Ender randomized in the multiworld: 6 checks (one per zone) and 6 items (keys for The Stronghold).
+    The Stronghold needs all 6 Eye of Ender items to be accessible."""
     display_name = "Eye of Ender Checks"
 
 
 class VillagerChecks(Toggle):
-    """Makes the captured villagers randomized in the multiworld. Freeing a captured camp merchant (Village Merchant,
-    Mystery Merchant, Luxury Merchant, Gift Wrapper, Blacksmith) sends a check instead of unlocking that merchant in
-    your camp, and the merchant is an item you receive from the multiworld."""
+    """Makes captured villagers randomized in the multiworld: freeing a merchant sends a check; the merchant itself is an item from the multiworld."""
     display_name = "Villager Checks"
 
 
@@ -179,19 +177,16 @@ class BonusChestCount(Range):
 
 class EmeraldGoal(Choice):
     """
-    Choose the amount of emeralds you need to have to finish your game if you choose goal.
+    Choose the amount of emeralds you need to have to finish your game if you choose goal (500–40000).
     Every 500 emeralds is a check if you chose checks or both.
     Ignored if you choose none.
     """
     display_name = "Emerald Goal"
     default = 10000
 
-    # option_<amount> = <amount> for every 500-multiple from 500 to
-    # 50000, plus option_disabled = 0. Built with a loop rather than
-    # typed out by hand - 100 entries is too many to hand-maintain, and
-    # this keeps it impossible for the option list and the 500-step
-    # milestone logic elsewhere (Locations.py/Regions.py/__init__.py) to
-    # quietly drift apart from each other.
+    # option_500 ... option_40000 (step 500) are generated by a loop instead of written by hand, to stay in sync
+    # with the milestone logic elsewhere. locals().update() only works because a class body namespace is a plain dict
+    # on CPython: keep it directly in the class body.
     option_disabled = 0
     locals().update({f"option_{amount}": amount for amount in range(500, 40000 + 1, 500)})
 
@@ -199,10 +194,7 @@ class EmeraldGoal(Choice):
     def from_any(cls, value):
         if isinstance(value, str):
             return super().from_any(value)
-        # numeric input (including a raw int typed directly into a YAML,
-        # which - unlike picking from the option list - isn't guaranteed
-        # to already be a valid 500-multiple): round down to the nearest
-        # valid one, same behavior the old Range.from_any had.
+        # Raw YAML input isn't guaranteed to be a valid 500-multiple; round down to the nearest one.
         rounded = (int(value) // 500) * 500
         rounded = max(0, min(rounded, 40000))
         return cls(rounded)
@@ -228,7 +220,8 @@ class EmeraldMode(Choice):
 
 
 class GameStore(Choice):
-    """Where the game came from"""
+    """Where you bought the game. This selects the memory offsets the client uses to read the game
+    (dungeons_reader.STORE_OFFSETS), so choose the store you actually play on."""
     display_name = "Game Store"
     option_steam = 0
     option_minecraft_launcher = 1
@@ -241,17 +234,11 @@ class GameStore(Choice):
         return {0: "steam", 1: "minecraft_launcher", 2: "microsoft_store"}[self.value]
 
 
-# value -> zone internal_name, in the same order the option_<slug>
-# attributes below get generated. generate_early's DLC validation and
-# Regions.py's completion-condition wiring both need this reverse lookup.
+# Maps option values to zone internal names, in the same order as the option_<slug> attributes below.
 GOAL_MISSION_ID_TO_ZONE: Dict[int, str] = {i: z.internal_name for i, z in enumerate(ZONES, start=1)}
 
-# GoalMission's valid choices depend on the full static zone list (base +
-# every DLC pack's missions), not on any one player's enabled DLC packs -
-# same reasoning as EMERALD_MILESTONE_TABLE in Locations.py: the option's
-# name->id table is fixed at class-definition time, before per-slot
-# options exist. Whether a DLC mission's pack is actually enabled for a
-# given player is validated separately, in generate_early (__init__.py).
+# Valid choices are the full static zone list (base + all DLC), not filtered by enabled packs —
+# the option table is fixed at class-definition time. generate_early validates the actual pack is enabled.
 _goal_mission_namespace = {
     "display_name": "Goal Mission",
     "__doc__": (

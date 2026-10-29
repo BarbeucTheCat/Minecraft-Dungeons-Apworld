@@ -1,44 +1,16 @@
 """
-Minecraft Dungeons - Archipelago world.
+Options.py    - all yaml options (DLC packs, EmeraldGoal/Mode, GoalMission, boss/mini-boss checks, BonusChestCount, DeathLink)
+ZoneData.py   - mission unlock map (requires, secret exits)
+Items.py      - Access items, Secret Access items, fillers
+Locations.py  - Mission Complete per zone, emerald milestones, boss first-kills, confirmed chests + bonus headroom
+Regions.py    - region graph, skips disabled DLC packs
+Rules.py      - logic rules
 
-How the files fit together:
-    Options.py    - every yaml option: one DLC-pack Toggle each (default off),
-                    EmeraldGoal + EmeraldMode (checks vs. goal, or both),
-                    GoalMission (a dynamic Choice covering every base+DLC
-                    mission - validated against which DLC packs are actually
-                    enabled in generate_early below), BossKillChecks /
-                    DlcBossKillChecks, BonusChestCount, and DeathLink
-    ZoneData.py   - the mission map itself: which mission unlocks which,
-                    and which ones are hidden behind a secret exit
-    Items.py      - every item: each zone's Access item, Secret Access (a secret zone uses only its Secret Access)
-                    items, and all the filler
-    Locations.py  - every location: one "Mission Complete" per zone;
-                    an emerald milestone every 500 up to EmeraldGoal's
-                    50000 ceiling (the table itself goes up to 500000 -
-                    10x headroom, so raising that ceiling later never
-                    needs new IDs); one "First Kill" per boss (opt-in);
-                    and, for zones where the real chest count has been
-                    confirmed by watching the game live (not assumed),
-                    a location per chest plus "Bonus Chest" headroom for
-                    any extras BonusChestCount allows for
-    Regions.py    - connects all of that into the actual region graph,
-                    skipping anything from a DLC pack you didn't enable
-    Rules.py      - the logic rules (what you need before you can reach
-                    a given mission)
+Client-side (client/): dungeons_reader.py detects milestones/boss kills/chests live in-game;
+give_item.py + apply_item_reward.py grant equipment rewards.
 
-Emerald milestones, boss kills, and chest opens are all detected live
-while you play, by dungeons_reader.py - that lives in client/, outside
-this folder, since it talks to the running game rather than doing
-anything at generation time. Equipment/location-specific item rewards
-work the same way, via give_item.py and apply_item_reward.py alongside
-it.
-
-If a zone isn't in Locations.py's ZONE_CHEST_COUNTS yet, that just
-means its chest layout hasn't been confirmed fixed - it only gets the
-one placeholder "Mission Complete" location for now. To add a new one,
-open every chest in that zone with dungeons_reader.py's
-watch_chest_events running, and confirm the count stays the same
-across repeat visits, before adding it here.
+Zones not in ZONE_CHEST_COUNTS only get a Mission Complete location.
+To add one: confirm the chest count is stable across repeat visits (watch_chest_events), then add it.   
 """
 
 from typing import Dict, List
@@ -54,25 +26,20 @@ from .Options import (
     FlamesOfTheNetherDLC, EchoingVoidDLC, DlcMissionsOptional, RequiredDlcs, DlcBossKillChecks, DlcMiniBossKillChecks,
 )
 from .Items import ITEM_TABLE, MISSION_ACCESS_ITEMS, SECRET_ACCESS_ITEMS, ANCIENT_HUNT_ACCESS_ITEM, FILLER_ITEMS, FILLER_ITEM_EMERALD_AMOUNTS, ITEM_REWARD_CATEGORIES, ITEM_REWARD_FILLERS, LOCATION_REWARD_ITEM_ZONE_CATEGORY, PROGRESSIVE_ENCHANT_SLOT_ITEM, PROGRESSIVE_ENCHANT_SLOT_COPIES, PROGRESSIVE_PICKUP_ITEM, PROGRESSIVE_PICKUP_COPIES, EYE_OF_ENDER_ITEM, EYE_OF_ENDER_COPIES, MCDungeonsItem, zone_access_item_name
-from .ZoneData import ZONES
-
+from .ZoneData import ZONES, ANCIENT_HUNT_ZONES, ZONES_BY_NAME, full_predecessor_chain
+from .Locations import (
+    LOCATION_TABLE, SECRET_PARENT_TO_ZONE, BOSS_KILL_TABLE, BOSS_ZONE,
+    get_base_boss_names, get_dlc_boss_names,
+    ANCIENT_HUNT_BOSS_KILL_TABLE,
+    wanted_mini_boss_zones, wanted_mini_boss_type_homes, EYE_OF_ENDER_TYPES, VILLAGER_TYPES,
+    ZONE_CHEST_COUNTS, get_bonus_chest_locations,
+)
+from .Regions import create_regions
 
 def launch_client(*args: str) -> None:
-    """Registered as this world's Launcher Component below - runs when
-    the user clicks "Minecraft Dungeons Client" in the Archipelago
-    Launcher. launch_subprocess runs dungeons_ap_client.py's launch()
-    in its own process (same mechanism every other Launcher-integrated
-    client uses), forwarding any args the Launcher itself received (e.g.
-    from a webhost "Connect" link) straight through to it.
-
-    Everything in this function runs in the LAUNCHER'S OWN process, not
-    a subprocess - dungeons_ap_client.py's own try/except (which holds a
-    window open on crash) can't help with anything that goes wrong here,
-    since that code hasn't been reached yet. A GUI button-click handler
-    swallowing an exception silently is exactly "nothing visibly
-    happens" from the user's side, so this is wrapped defensively and
-    written to a crash log file that will exist even if the Launcher
-    itself shows nothing - check it first if the client won't open."""
+    """Runs dungeons_ap_client.py's launch() in a subprocess; forwards Launcher args through.
+    Wrapped defensively with a crash log: this runs in the Launcher's own process, before the client's
+    own error handling — check the log first if the client won't open."""   
     try:
         from .client.dungeons_ap_client import launch
         launch_subprocess(launch, name="Minecraft Dungeons Client", args=args)
@@ -94,16 +61,6 @@ components.append(
         component_type=Type.CLIENT,
     )
 )
-from .Locations import (
-    LOCATION_TABLE, SECRET_PARENT_TO_ZONE, BOSS_KILL_TABLE, BOSS_ZONE,
-    get_base_boss_names, get_dlc_boss_names,
-    ANCIENT_HUNT_BOSS_KILL_TABLE,
-    wanted_mini_boss_zones, wanted_mini_boss_type_homes, EYE_OF_ENDER_TYPES, VILLAGER_TYPES,
-    ZONE_CHEST_COUNTS, get_bonus_chest_locations,
-)
-from .ZoneData import ZONES, ANCIENT_HUNT_ZONES, ZONES_BY_NAME, full_predecessor_chain
-from .Regions import create_regions
-
 
 class MCDungeonsWeb(WebWorld):
     tutorials = [
@@ -135,8 +92,7 @@ class MCDungeonsWeb(WebWorld):
 
 
 class MCDungeonsWorld(World):
-    """Minecraft Dungeons - defeat missions across the Mainland, with six
-    optional DLC packs, to reach the end of your seed."""
+    """Minecraft Dungeons — clear missions across the Mainland (plus six optional DLC packs) to complete your seed."""
 
     game = "Minecraft Dungeons"
     web = MCDungeonsWeb()
@@ -149,15 +105,8 @@ class MCDungeonsWorld(World):
     location_class = None  # set to your Location subclass if you add one; None uses the base class
 
     def generate_early(self) -> None:
-        # Squid Coast unlocks everything else - every other mission
-        # ultimately needs it. Its own Access item is a normal
-        # randomized item like any other zone's, though, and nothing
-        # else guarantees you'll receive it early. Without this, a
-        # player could get stuck unable to start the game at all until
-        # the multiworld happens to send it their way. Giving it to
-        # everyone right from the start avoids that - matching the
-        # base game, where Squid Coast was never locked behind
-        # anything.
+        # Squid Coast is the root of the mission tree (every other zone needs it). Its Access item is given
+        # to everyone at start (not placed in the pool) to avoid a soft-lock — matches the base game.
         self.multiworld.push_precollected(self.create_item("Squid Coast Access"))
 
         goal_mission_id = self.options.goal_mission.value
@@ -173,21 +122,8 @@ class MCDungeonsWorld(World):
                     f"pack, or choose a different Goal Mission."
                 )
 
-            # The access rule for reaching your chosen goal zone is
-            # already "early" (see Regions.py/Rules.py - it only checks
-            # the zone's own Access item plus its skip-level
-            # predecessor's), but that's a statement about LOGIC, not
-            # about where the fill algorithm actually puts those Access
-            # items. Left alone, "Soggy Swamp Access" is just another
-            # progression item and can land anywhere reachable - including
-            # deep in a late zone's chest, forcing you through most of
-            # the mission tree to pick it up even though the rule itself
-            # never asked for that. Pushing every Access item (and,
-            # where SecretMissionsAccess is on, every Secret Access item)
-            # on the FULL predecessor chain into early_items fixes this:
-            # AP's fill weights early_items entries toward early spheres,
-            # so your goal's whole critical path - not just its logic
-            # rule - actually resolves early too.
+            # The goal zone's access rule is already "early," but that only controls logic, not where fill places the Access items.
+            # Pushing every Access item on the full predecessor chain into early_items makes fill weight them toward early spheres.   
             enabled_names = {
                 z.internal_name for z in ZONES
                 if z.category == "base" or bool(getattr(self.options, z.dlc_pack))
@@ -202,7 +138,7 @@ class MCDungeonsWorld(World):
 
         if not self.options.emerald_mode.goal_enabled and goal_mission_id == GoalMission.option_none:
             raise OptionError(
-                f"{self.player_name}: no win condition is set - Emerald Mode is 'neither' "
+                f"{self.player_name}: no win condition is set - Emerald Mode is 'none' "
                 f"or 'checks' (doesn't include the goal) and Goal Mission is 'None'. Set "
                 f"Emerald Mode to 'goal' or 'both', and/or pick a Goal Mission."
             )
@@ -211,7 +147,7 @@ class MCDungeonsWorld(World):
             raise OptionError(
                 f"{self.player_name}: Emerald Mode includes the goal but Emerald "
                 f"Goal is 0 - either raise Emerald Goal to at least 500, or set "
-                f"Emerald Mode to 'neither'/'checks' (and make sure Goal Mission is set "
+                f"Emerald Mode to 'none'/'checks' (and make sure Goal Mission is set "
                 f"instead)."
             )
 
@@ -242,13 +178,9 @@ class MCDungeonsWorld(World):
         pool: List[Item] = []
 
         for zone in enabled_zones:
-            # Squid Coast Access is already given to everyone at the
-            # start (see generate_early) - not added here too, or
-            # there'd be two copies: one you already have, and one
-            # placed somewhere random. That would put one more item in
-            # the pool than there are locations to hold it.
-            # ONE access item per zone: a secret zone's is its Secret Access when the option is on
-            # (its plain Access is then not in the pool at all), every other zone's is its Access.
+            # Squid Coast Access is given at start (generate_early); adding it here too would create a duplicate
+            # (more items than locations to hold them).
+            # One access item per zone: Secret Access for secret zones with the option on, plain Access otherwise.   
             if zone.internal_name != "squidcoast":
                 pool.append(self.create_item(
                     zone_access_item_name(zone, bool(self.options.secret_missions_require_secret))))
@@ -256,63 +188,33 @@ class MCDungeonsWorld(World):
         if self.options.ancient_hunts:
             pool.append(self.create_item(ANCIENT_HUNT_ACCESS_ITEM))
 
-        # Progressive enchant slot capacity - 3 copies, each one raising
-        # the player's granted-item enchant slot cap by one (0 received =
-        # 0 slots, all 3 received = full 3 slots). See Items.py's comment
-        # for the full design; the client (apply_item_reward.py /
-        # watch_item_rewards) counts received copies and passes that as
-        # num_slots on every give_random_item/give_location_reward call.
+        # Three copies; each one the player finds raises the enchant slot cap on granted items by one.
         for _ in range(PROGRESSIVE_ENCHANT_SLOT_COPIES):
             pool.append(self.create_item(PROGRESSIVE_ENCHANT_SLOT_ITEM))
 
-        # Eye of Ender items: the six keys The Stronghold needs when the eye_of_ender_checks option is on
-        # (one location per Eye type lives in Regions.py; this is their matching items).
+        # Six copies (one per Eye type), only in the pool when the option is on. The Stronghold needs all six.
+        # One location per Eye type in Regions.py.   
         if self.options.eye_of_ender_checks:
             for _ in range(EYE_OF_ENDER_COPIES):
                 pool.append(self.create_item(EYE_OF_ENDER_ITEM))
 
-        # Villager items: one camp merchant per captured villager whose mission is in the seed (the matching
-        # locations are added in Regions.py, only for enabled zones too, so the counts always agree).
+        # One per camp merchant per captured villager, only for enabled zones (locations in Regions.py; counts must agree).   
         if self.options.villager_checks:
             enabled_zone_names_for_villagers = {z.internal_name for z in enabled_zones}
-            if self.options.ancient_hunts:      # the Piglin Merchant check lives in an Ancient Hunt
+            if self.options.ancient_hunts:      # the Piglin Merchant check lives in any Ancient Hunt
                 enabled_zone_names_for_villagers |= {z.internal_name for z in ANCIENT_HUNT_ZONES}
             for _key, _fragment, villager_display, villager_zone in VILLAGER_TYPES:
                 if villager_zone in enabled_zone_names_for_villagers:
                     pool.append(self.create_item(villager_display))
 
-        # Progressive pickup unlock - only if the option is actually on;
-        # previously this option existed but placed no item at all, so
-        # there was nothing to hint and no way to ever raise the tier
-        # once enabled. See Items.py's comment for the full design.
+        # Only in the pool when the option is on.   
         if self.options.progressive_pickups:
             for _ in range(PROGRESSIVE_PICKUP_COPIES):
                 pool.append(self.create_item(PROGRESSIVE_PICKUP_ITEM))
 
-        # Fill remaining slots with filler items so the pool matches the
-        # location count: one location per created zone/hunt, plus one per
-        # emerald milestone (500 up to this player's emerald_goal), plus
-        # one per boss first-kill (always added - not DLC-gated, see
-        # Locations.py's BOSS_KILL_TABLE comment).
-        #
-        # Filler composition is weighted, NOT a flat random.choice over
-        # every filler name - a flat choice would badly skew toward
-        # whichever "kind" happens to have the most distinct named
-        # entries (there are 37 location-specific reward names vs only 3
-        # emerald tiers, so a flat pick would make emeralds ~7% of filler
-        # and location rewards ~82%, purely from how many entries each
-        # kind happens to have - not an intentional design choice).
-        #
-        # Instead: emeralds are picked as a whole "kind" with priority
-        # weight over item-type rewards as a whole. Within item-type
-        # rewards, every EQUIPMENT CATEGORY (Melee/Ranged/Armor/Artifact/
-        # Any) gets equal odds first, and only THEN does it pick uniformly
-        # among that category's available names (its one generic "Random
-        # X" filler plus however many location-specific variants exist for
-        # it) - so having many Melee location-rewards doesn't make melee
-        # overall more common than armor, it just adds variety within melee.
-        # See Regions.py's emerald block: "goal"-only mode still adds
-        # exactly one location (the top milestone), not the full range.
+        # Fills remaining slots so pool size matches location count.
+        # Weighted by kind (emeralds vs item-type), then by equipment category within item-type — not a flat pick over all names,
+        # which would skew toward whichever kind has the most entries.   
         goal = self.options.emerald_goal.value
         emerald_milestone_count = 0
         if goal >= 500:
@@ -363,9 +265,7 @@ class MCDungeonsWorld(World):
             else 0
         )
 
-        # Per-zone chest/supply-chest locations (ZONE_CHEST_COUNTS) - only
-        # for zones that are both confirmed-fixed AND enabled this
-        # generation (DLC pack on), matching exactly what Regions.py adds.
+        # Per-zone chest locations from ZONE_CHEST_COUNTS; only for confirmed-fixed, enabled zones (matches Regions.py).   
         enabled_zone_names_for_chests = {z.internal_name for z in enabled_zones}
         zone_chest_location_count = 0
         for zone_name, (chest_n, supply_n) in ZONE_CHEST_COUNTS.items():
@@ -373,17 +273,11 @@ class MCDungeonsWorld(World):
                 continue
             zone_chest_location_count += chest_n + supply_n
 
-        # Global bonus chest locations - NOT per-zone, trimmed to this
-        # player's BonusChestCount option (0-100). Always added to Menu
-        # regardless of which zones are enabled (see Regions.py), so no
-        # DLC-pack filtering here, unlike the per-zone count above.
+        # Global bonus chests (not per-zone), trimmed to BonusChestCount, always attached to Menu — no DLC filtering.   
         bonus_chest_location_count = len(get_bonus_chest_locations(self.options.bonus_chest_count.value))
 
-        # Locations holding a locked "Victory" event item (see Regions.py's
-        # _place_victory_event) never receive a pool-filled item - they're
-        # already counted once above (as part of emerald_milestone_count /
-        # enabled_zones' Mission Complete locations), so subtract them back
-        # out here rather than double-handling them.
+        # Victory event locations already hold a locked item, so they're subtracted from the filler count
+        # (they were included in the location total above).   
         victory_event_location_count = 0
         if self.options.emerald_mode.goal_enabled and goal >= 500:
             victory_event_location_count += 1
@@ -437,9 +331,7 @@ class MCDungeonsWorld(World):
 
     @classmethod
     def _apworld_version(cls) -> str:
-        """Version of this apworld, read from its archipelago.json manifest.
-        Archipelago 0.6.8+ exposes it as World.world_version / World.manifest; older
-        versions don't, so everything is read defensively."""
+        """Version from archipelago.json; read defensively (World.world_version/manifest only exist in AP 0.6.8+).   """
         version = getattr(cls, "world_version", None)
         if version is not None and tuple(version) != (0, 0, 0):
             return ".".join(str(part) for part in version)
@@ -477,6 +369,6 @@ class MCDungeonsWorld(World):
             "progressive_pickups": bool(self.options.progressive_pickups),
             "bonus_chest_count": self.options.bonus_chest_count.value,
             "death_link": bool(self.options.death_link),
-            # DLC packs whose checks never hold progression items (client map: yellow instead of green)
+            # DLC packs whose checks never hold progression items
             "optional_dlc_packs": list(getattr(self, "optional_dlc_packs", [])),
         }

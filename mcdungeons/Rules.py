@@ -10,12 +10,8 @@ if TYPE_CHECKING:
 
 
 def make_zone_rule(world: "MCDungeonsWorld", zone: ZoneInfo, valid_requires: List[str]) -> CollectionRule:
-    """You need ONE item per zone: the zone's own, plus that of every zone in valid_requires. That item is the
-    zone's Access item, except for a secret zone with the secret_missions_require_secret option on, whose single
-    item is its Secret Access (see Items.zone_access_item_name; the client keeps a secret mission locked in-game
-    until that item is received).
-    valid_requires is usually the zone's skip-level predecessors (see
-    ZoneData.skip_level_requires_map), not its raw direct requires[]."""
+    """Returns the access rule for a zone: its own Access item (Secret Access for secret zones with the option on)
+    plus every item in valid_requires (skip-level predecessors, see skip_level_requires_map)."""
     player = world.player
     require_secret_option = bool(world.options.secret_missions_require_secret)
 

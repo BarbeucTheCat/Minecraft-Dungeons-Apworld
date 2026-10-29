@@ -2,20 +2,8 @@ from typing import Dict, List, NamedTuple, Optional, Tuple
 try:
     from BaseClasses import Item, ItemClassification
 except ImportError:
-    # Client-only environments (no full Archipelago install) can't import
-    # BaseClasses - same situation _apworld_data.py's docstring describes
-    # for Locations.py/ZoneData.py. Nothing here actually needs the real
-    # Item class (nothing instantiates one - this module only ever builds
-    # ItemInfo tuples), and ItemClassification's specific bit VALUES don't
-    # matter client-side either - the client only ever reads ItemInfo.code
-    # to resolve a received item ID back to a name, never .classification.
-    # This is a client-only fallback, never a generation-time one: real
-    # generation always has BaseClasses available, so this branch is
-    # unreachable there and can never silently produce a wrong seed.
-    # Nothing here actually instantiates a real Item (this module only
-    # ever builds ItemInfo tuples for its own tables) - MCDungeonsItem
-    # below still needs SOMETHING subclassable though, hence a plain
-    # placeholder rather than None.
+    # Client can't import BaseClasses; these placeholders stand in for Item and ItemClassification.
+    # Only builds ItemInfo tuples. Never runs at generation time.     
     class Item:
         pass
 
@@ -34,7 +22,7 @@ class ItemInfo(NamedTuple):
     classification: ItemClassification
 
 
-BASE_ITEM_ID = 0xDC0000  # arbitrary offset - replace with your registered AP game ID block
+BASE_ITEM_ID = 0xDC0000  # the offset that determines the item IDs; this value must not change
 
 _next_id = [BASE_ITEM_ID]
 
@@ -44,17 +32,13 @@ def _alloc_id() -> int:
     return _next_id[0]
 
 
-# One "Mission Access" progression item per zone (base + DLC). Whether a
-# given zone's item actually gets placed in the pool is decided in __init__.py
-# based on which DLC options are enabled.
+# One "Mission Access" progression item per zone (base + DLC).
 MISSION_ACCESS_ITEMS: Dict[str, ItemInfo] = {
     f"{z.display_name} Access": ItemInfo(_alloc_id(), ItemClassification.progression)
     for z in ZONES
 }
 
-# Secret-mission access, only meaningful when secret_missions_require_secret is on. With that option a secret zone
-# is unlocked by its "<Zone> Secret Access" item ALONE (see zone_access_item_name); its plain "<Zone> Access" item
-# then never enters the pool. Both stay in the table either way so that no item ID ever moves.
+# Plain and secret access items both stay in the table so IDs never shift.   
 SECRET_ACCESS_ITEMS: Dict[str, ItemInfo] = {
     f"{z.display_name} Secret Access": ItemInfo(_alloc_id(), ItemClassification.progression)
     for z in ZONES if z.secret
@@ -62,9 +46,8 @@ SECRET_ACCESS_ITEMS: Dict[str, ItemInfo] = {
 
 
 def zone_access_item_name(zone, secret_option: bool) -> str:
-    """Name of the ONE item that unlocks `zone`, and that counts as the zone's Access for the zones after it.
-    A secret zone with Secret Mission Access on needs only "<Zone> Secret Access"; every other zone (and every
-    zone with the option off) uses "<Zone> Access"."""
+    """The one item that unlocks `zone` and counts as Access for later zones.
+    Secret zones with the option on use "<Zone> Secret Access"."""
     if secret_option and zone.secret:
         return f"{zone.display_name} Secret Access"
     return f"{zone.display_name} Access"
@@ -72,48 +55,25 @@ def zone_access_item_name(zone, secret_option: bool) -> str:
 # Single item gating all three Ancient Hunts at once.
 ANCIENT_HUNT_ACCESS_ITEM = "Ancient Hunt Access"
 
-# Progressive enchant slot capacity. give_item.py's give_random_item /
-# give_location_reward now take a num_slots argument (0-3) controlling
-# how many enchant slots a granted item actually gets, instead of always
-# granting the max 3. This item is placed in the pool 3 TIMES - a
-# player's current tier is however many copies they've received so far
-# (0 copies received = 0 slots, all the way up to 3). The client (see
-# apply_item_reward.py / watch_item_rewards) is responsible for counting
-# how many of these it's received and passing that count as num_slots on
-# every subsequent give_random_item/give_location_reward call.
+# Three copies are in the pool; each one the player finds grants an enchant slot.
 PROGRESSIVE_ENCHANT_SLOT_ITEM = "Progressive Enchant Slot"
 PROGRESSIVE_ENCHANT_SLOT_COPIES = 3  # 0/1/2/3 slots - one copy per tier above 0
 
-# Progressive pickup unlock. Options.py's ProgressivePickups describes 4
-# tiers (0: arrows/tools/weapons/armor, 1: adds health items, 2: adds
-# potions, 3: adds TNT - the final tier), so 3 copies are needed to climb
-# from the starting tier 0 up to the final tier 3, same one-copy-per-step
-# pattern as PROGRESSIVE_ENCHANT_SLOT_ITEM above. Marked `progression` (not
-# `filler`) specifically so it's used in logic/reachability and so
-# `!hint`/auto-hinting treat it like any other required item, not junk -
-# without a real item backing this option, there was nothing to hint at
-# all and the option's tiers could never actually progress once toggled
-# on. Only added to the pool when the option is enabled (see __init__.py).
+# Each copy unlocks a new tier. Always in logic (marked as progression); only in the pool when the option is on.
 PROGRESSIVE_PICKUP_ITEM = "Progressive Pickup"
-PROGRESSIVE_PICKUP_COPIES = 3  # tier 0 (start) -> 1 -> 2 -> 3 (final tier)
+PROGRESSIVE_PICKUP_COPIES = 3  # 0/1/2/3 Tiers
 
-# Eye of Ender: 6 identical progression items, only created with the eye_of_ender_checks option. They are
-# the logic keys for The Stronghold (Rules.py: it needs all of them); the real Eyes the mini bosses drop are
-# turned into checks instead (Locations.py EYE_OF_ENDER_TABLE). Added at the very END of ITEM_TABLE so no
-# existing item ID shifts.
+# Six copies, only in the pool when the option is on. The Stronghold needs all six.
+# The real Eyes from mini bosses become checks instead.
 EYE_OF_ENDER_ITEM = "Eye of Ender"
 EYE_OF_ENDER_COPIES = 6
 
-# Villager items (option villager_checks): one per captured camp merchant, received instead of freeing the villager
-# in the mission. Unlocks the merchant in the camp. Names must match Locations.VILLAGER_TYPES' display names (a
-# test keeps them in line). Added at the very END of ITEM_TABLE so no existing item ID shifts.
+# One per camp merchant, received instead of freeing the villager; unlocks that merchant.
+# Only in the pool when the option is on. Names must match VILLAGER_TYPES display names (enforced by a test).   
 VILLAGER_ITEM_NAMES = ["Village Merchant", "Mystery Merchant", "Luxury Merchant", "Gift Wrapper", "Blacksmith",
                        "Enchantsmith", "Piglin Merchant"]
 
-# Tiered emerald filler rewards. The amount each one grants is looked up
-# by dungeons_reader.py (via FILLER_ITEM_EMERALD_AMOUNTS below) when the
-# corresponding item is received over the network - it's a straight
-# addition to the player's current emerald total, not a new item.
+# Each one adds emeralds to the player's total (no in-game object).   
 FILLER_ITEM_EMERALD_AMOUNTS: Dict[str, int] = {
     "100 Emeralds": 100,
     "300 Emeralds": 300,
@@ -125,42 +85,16 @@ FILLER_ITEMS: Dict[str, ItemInfo] = {
     for name in FILLER_ITEM_EMERALD_AMOUNTS
 }
 
-# Item-equipment filler rewards - actual random weapons/armor granted
-# in-game via give_item.py's give_random_item() when received (see
-# apply_item_reward.py, which lives alongside give_item.py outside this
-# world folder, same reasoning as ap_client.py/dungeons_reader.py: these
-# act against a live game process, not at generation time). Distinct
-# from FILLER_ITEM_EMERALD_AMOUNTS above - those add emeralds directly;
-# these grant a real item with random matching enchants, same as
-# give_random_item(category=...) already tested standalone.
+# Grants random gear in the named category; specific piece rolled at receive time (enchants for non-artifacts).
 ITEM_REWARD_CATEGORIES: Dict[str, Optional[str]] = {
     "Random Melee Weapon": "Melee",
     "Random Ranged Weapon": "Ranged",
     "Random Armor": "Armor",
-    "Random Artifact": "Artifact",  # no enchant slots - give_random_item skips enchant logic entirely for these
-    "Random Item": None,  # any of the three EQUIPMENT categories above (not Artifact - ask for that explicitly)
+    "Random Artifact": "Artifact",  # no enchant slots
+    "Random Item": None,   # no fixed item; one is rolled at receive time; Cannot include artifacts
 }
-
-# ------------------------------------------------------------------
-# Location-specific reward items: the reward's pool is fixed by which
-# ITEM this is (decided here, at generation time), not by the player's
-# current in-game zone or unlock progress at receive time - e.g. "Squid
-# Coast Artifact Reward" always draws from Squid Coast's curated pool
-# (Fireworks Arrow / Fishing Rod - see location_reward_pools.py) no
-# matter where the player is or whether they've even reached Squid
-# Coast yet. Selection WITHIN a pool is still random; which pool applies
-# is not.
-#
-# This list only needs the (zone, category) PAIRS that have a pool
-# defined - the actual pool CONTENTS live in location_reward_pools.py,
-# which is a client-side file (alongside give_item.py), not imported
-# here, since world generation and the game client may not share an
-# environment. Keep this list in sync with location_reward_pools.py's
-# keys by hand when you add a new zone's pool - this only decides which
-# distinct reward ITEM TYPES exist and get IDs; apply_item_reward.py
-# (also client-side) is what actually resolves a pool's contents at
-# grant time.
-# ------------------------------------------------------------------
+# Pool is fixed by the item at generation, not by the player's location at receive time.
+# Keep in sync with location_reward_pools.py by hand.
 
 LOCATION_REWARD_TYPES: List[Tuple[str, str]] = [
     ("squidcoast", "Artifact"),
@@ -234,15 +168,8 @@ ITEM_TABLE: Dict[str, ItemInfo] = {
     **ITEM_REWARD_FILLERS,
     **LOCATION_REWARD_ITEMS,
 
-    # Victory item carriers (see Regions.py's _place_victory_event) - NOT
-    # purely virtual AP "events" (those need address=None, and the whole
-    # point here is these stay on a REAL, network-checkable location -
-    # dungeons_reader.py reports them like any other check). A real
-    # location holding an item with code=None is invalid (AP core's
-    # Main.py asserts on it: "item code None should be event, location
-    # .address should then also be None") - these two need real,
-    # allocated codes instead. Added at the very end, AFTER every other
-    # _alloc_id() call in this file/ITEM_TABLE, so no existing ID shifts.
+    # On a real location, not a virtual event — AP core rejects code=None there, so these items need real codes.
+    # New items go at the end of the table so no existing ID shifts.   
     "Victory - Emerald Goal": ItemInfo(_alloc_id(), ItemClassification.progression),
     "Victory - Goal Mission": ItemInfo(_alloc_id(), ItemClassification.progression),
     EYE_OF_ENDER_ITEM: ItemInfo(_alloc_id(), ItemClassification.progression),
